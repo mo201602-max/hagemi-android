@@ -38,6 +38,11 @@ class MainActivity : ComponentActivity() {
     private var capture: ImageCapture? = null
     private var cameraScreen = false
     private var busy = false
+    private var stopGuidance: (() -> Unit)? = null
+    private var sonar: android.media.ToneGenerator? = null
+    private val shutterSound = android.media.MediaActionSound()
+    override fun onStop() { stopGuidance?.invoke(); super.onStop() }
+    override fun onDestroy() { sonar?.release(); shutterSound.release(); super.onDestroy() }
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) showCamera() else {
             toast("撮影にはカメラの許可が必要です。端末の設定から変更できます")
@@ -47,6 +52,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        shutterSound.load(android.media.MediaActionSound.SHUTTER_CLICK)
         store = RecordStore(this)
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -74,6 +80,8 @@ class MainActivity : ComponentActivity() {
         text = value; isAllCaps = false; setOnClickListener { action() }
     }
     private fun showTimeline() {
+        stopGuidance?.invoke()
+        stopGuidance = null
         cameraScreen = false
         capture = null
         provider?.unbindAll()
@@ -123,7 +131,7 @@ class MainActivity : ComponentActivity() {
         cameraScreen = true
         root.removeAllViews()
         root.addView(label("白黒で記録する", 24f))
-        root.addView(label("髪と頭皮の明暗差から候補を探します。\n黄色の枠は検出候補です。撮影は手動です。", 14f))
+        root.addView(label("黄色の枠を中央へ。\nソナーをONにすると安定後に自動撮影します。", 14f))
         val detectionStatus = label("検出の準備中…", 14f)
         val preview = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -138,6 +146,30 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(cameraFrame, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(detectionStatus)
+        val automatic = Switch(this).apply { text = "ソナー音・自動撮影" }
+        root.addView(automatic)
+        val gate = AutoCaptureGate()
+        var ready = false
+        var lastSeen = 0L
+        var lastTone = 0L
+        var focusing = false
+        var focusGeneration = 0
+        var focusCamera: androidx.camera.core.Camera? = null
+        var latestTarget: AutoCaptureGate.Target? = null
+        fun resetGuidance() {
+            gate.reset(); ready = false; lastSeen = 0L; lastTone = 0L
+            latestTarget = null; focusing = false; focusGeneration++
+            sonar?.stopTone()
+            focusCamera?.cameraControl?.cancelFocusAndMetering()
+        }
+        automatic.setOnCheckedChangeListener { _, checked ->
+            resetGuidance()
+            if (checked && sonar == null) {
+                sonar = runCatching { android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 60) }.getOrNull()
+                if (sonar == null) toast("音を開始できませんでした。画面の案内で自動撮影します")
+            }
+        }
+        stopGuidance = { automatic.isChecked = false; resetGuidance() }
         val note = EditText(this).apply { hint = "今日のメモ（任意）"; maxLines = 2; filters = arrayOf(android.text.InputFilter.LengthFilter(500)) }
         root.addView(note)
         val shutter = button("カメラの準備中…") {}
@@ -192,23 +224,64 @@ class MainActivity : ComponentActivity() {
                             runOnUiThread {
                                 if (cameraScreen && preview.isAttachedToWindow && !isDestroyed && !busy) {
                                     val output = preview.outputTransform
-                                    if (box != null && output != null) {
+                                    if (box != null && output != null && android.os.SystemClock.elapsedRealtime() - now < 450) {
                                         CoordinateTransform(source, output).mapRect(box)
                                         if (box.intersect(0f, 0f, preview.width.toFloat(), preview.height.toFloat())) {
                                             overlay.update(box)
                                             val distance = kotlin.math.hypot(
                                                 (box.centerX() - preview.width / 2f) / preview.width,
                                                 (box.centerY() - preview.height / 2f) / preview.height)
-                                            detectionStatus.text = if (distance < 0.12f) "候補が中央付近です。枠を確認して撮影♡" else "候補の黄色い枠を中央の十字へ"
-                                        } else { overlay.update(null); detectionStatus.text = "候補を探しています…" }
-                                    } else { overlay.update(null); detectionStatus.text = "髪と頭皮を一緒に映してね。候補を探しています…" }
+                                            detectionStatus.text = if (distance < 0.10f) "中央です。そのまま動かさずに♡" else "候補の黄色い枠を中央の十字へ"
+                                            if (automatic.isChecked && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+                                                val clock = android.os.SystemClock.elapsedRealtime()
+                                                val target = AutoCaptureGate.Target(box.centerX().toDouble() / preview.width,
+                                                    box.centerY().toDouble() / preview.height,
+                                                    box.width().toDouble() * box.height() / (preview.width.toDouble() * preview.height))
+                                                latestTarget = target
+                                                lastSeen = now
+                                                ready = gate.update(target, now)
+                                                if (clock - lastTone >= AutoCaptureGate.interval(distance.toDouble())) {
+                                                    sonar?.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 70)
+                                                    lastTone = clock
+                                                }
+                                                if (ready && !focusing) {
+                                                    focusing = true
+                                                    val generation = ++focusGeneration
+                                                    val focusedTarget = target
+                                                    val point = preview.meteringPointFactory.createPoint(box.centerX(), box.centerY())
+                                                    val focus = focusCamera?.cameraControl?.startFocusAndMetering(
+                                                        FocusMeteringAction.Builder(point).setAutoCancelDuration(2, java.util.concurrent.TimeUnit.SECONDS).build())
+                                                    detectionStatus.text = "ピントを確認中…"
+                                                    focus?.addListener({
+                                                        if (generation != focusGeneration) return@addListener
+                                                        focusing = false
+                                                        val current = latestTarget
+                                                        val sameTarget = current != null && kotlin.math.hypot(current.x - focusedTarget.x, current.y - focusedTarget.y) < .03 &&
+                                                            kotlin.math.abs(current.area - focusedTarget.area) / focusedTarget.area.coerceAtLeast(.0001) < .2
+                                                        val success = runCatching { focus.get().isFocusSuccessful }.getOrDefault(false)
+                                                        if (success && sameTarget && ready && automatic.isChecked && cameraScreen &&
+                                                            preview.isAttachedToWindow && !busy && !isDestroyed &&
+                                                            lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
+                                                            android.os.SystemClock.elapsedRealtime() - lastSeen < 450) {
+                                                            automatic.isChecked = false
+                                                            shutter.performClick()
+                                                        } else {
+                                                            resetGuidance()
+                                                            detectionStatus.text = "もう一度、中央で止めてね。手動撮影も使えます"
+                                                        }
+                                                    }, ContextCompat.getMainExecutor(this))
+                                                    if (focus == null) { resetGuidance() }
+                                                }
+                                            }
+                                        } else { resetGuidance(); overlay.update(null); detectionStatus.text = "候補を探しています…" }
+                                    } else { resetGuidance(); overlay.update(null); detectionStatus.text = "髪と頭皮を一緒に映してね。候補を探しています…" }
                                 }
                             }
                         }
                     } catch (error: Exception) {
                         runOnUiThread {
                             if (cameraScreen && preview.isAttachedToWindow && !isDestroyed) {
-                                overlay.update(null); detectionStatus.text = "検出を再試行中。手動撮影も使えます"
+                                resetGuidance(); overlay.update(null); detectionStatus.text = "検出を再試行中。手動撮影も使えます"
                             }
                         }
                     } finally { image.close() }
@@ -217,9 +290,10 @@ class MainActivity : ComponentActivity() {
                 val group = UseCaseGroup.Builder().addUseCase(cameraPreview).addUseCase(capture!!).addUseCase(analysis)
                 preview.viewPort?.let { group.setViewPort(it) }
                 try {
-                    provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, group.build())
+                    focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, group.build())
                 } catch (error: IllegalArgumentException) {
                     analysis.clearAnalyzer()
+                    automatic.isEnabled = false
                     provider!!.unbindAll()
                     provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraPreview, capture)
                     detectionStatus.text = "この端末では検出を起動できません。手動撮影は使えます"
@@ -229,6 +303,8 @@ class MainActivity : ComponentActivity() {
                 shutter.setOnClickListener {
                     val imageCapture = capture ?: return@setOnClickListener
                     if (busy) return@setOnClickListener
+                    automatic.isChecked = false
+                    resetGuidance()
                     busy = true; shutter.isEnabled = false; back.isEnabled = false; shutter.text = "保存中…"
                     val memo = note.text.toString().trim()
                     val temp = try { File.createTempFile("capture-", ".jpg", cacheDir) } catch (error: Exception) {
@@ -236,6 +312,7 @@ class MainActivity : ComponentActivity() {
                         toast("撮影用の空き容量を確保できませんでした")
                         return@setOnClickListener
                     }
+                    shutterSound.play(android.media.MediaActionSound.SHUTTER_CLICK)
                     imageCapture.targetRotation = preview.display.rotation
                     imageCapture.takePicture(ImageCapture.OutputFileOptions.Builder(temp).build(), worker,
                         object : ImageCapture.OnImageSavedCallback {
