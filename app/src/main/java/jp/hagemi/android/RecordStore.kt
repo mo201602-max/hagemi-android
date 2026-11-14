@@ -7,7 +7,7 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
-data class Record(val id: String, val time: Long, val note: String, val photo: File)
+data class Record(val id: String, val time: Long, val note: String, val photo: File, val measurement: Measurement? = null)
 
 /** All records stay in app-private storage. No network or shared gallery access. */
 class RecordStore(context: Context) {
@@ -16,7 +16,7 @@ class RecordStore(context: Context) {
         runCatching {
             val json = JSONObject(file.readText())
             val photo = File(folder, "${file.nameWithoutExtension}.jpg")
-            if (!photo.exists()) null else Record(file.nameWithoutExtension, json.getLong("time"), json.optString("note"), photo)
+            if (!photo.exists()) null else Record(file.nameWithoutExtension, json.getLong("time"), json.optString("note"), photo, readMeasurement(json))
         }.getOrNull()
     }.sortedByDescending { it.time }
 
@@ -55,6 +55,36 @@ class RecordStore(context: Context) {
         } catch (error: Exception) {
             photo.delete(); metadata.delete(); throw error
         } finally { bitmap.recycle() }
+    }
+    private fun readMeasurement(json: JSONObject): Measurement? = runCatching {
+        val item = json.optJSONObject("measurement") ?: return null
+        fun region(key: String): Region {
+            val box = item.getJSONArray(key)
+            return Region(box.getDouble(0), box.getDouble(1), box.getDouble(2), box.getDouble(3)).also { require(it.isValid) }
+        }
+        val bald = region("bald")
+        val reference = if (item.has("reference")) region("reference") else null
+        val count = if (item.has("count")) item.getInt("count") else null
+        Measurement(bald, reference, count).also { it.estimate }
+    }.getOrNull()
+
+    fun saveMeasurement(record: Record, measurement: Measurement) {
+        require(measurement.bald.isValid)
+        measurement.estimate // Validate the density input before writing.
+        val metadata = File(folder, "${record.id}.json")
+        val json = JSONObject(metadata.readText())
+        fun array(region: Region) = org.json.JSONArray(listOf(region.left, region.top, region.right, region.bottom))
+        val item = JSONObject().put("version", 1).put("method", "manual-reference-density")
+            .put("bald", array(measurement.bald))
+        measurement.reference?.let { item.put("reference", array(it)) }
+        measurement.count?.let { item.put("count", it) }
+        json.put("measurement", item)
+        val atomic = android.util.AtomicFile(metadata)
+        val output = atomic.startWrite()
+        try {
+            output.write(json.toString().toByteArray(Charsets.UTF_8))
+            atomic.finishWrite(output)
+        } catch (error: Exception) { atomic.failWrite(output); throw error }
     }
     fun delete(record: Record) { File(folder, "${record.id}.json").delete(); record.photo.delete() }
 }
