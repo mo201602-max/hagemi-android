@@ -15,6 +15,7 @@ class MeasurementActivity : ComponentActivity() {
     companion object { private val worker = Executors.newSingleThreadExecutor() }
     private var selection: RegionView? = null
     private var countField: EditText? = null
+    private var candidateCount = false
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
@@ -55,12 +56,13 @@ class MeasurementActivity : ComponentActivity() {
                     filters = arrayOf(InputFilter.LengthFilter(5))
                     setText(savedInstanceState?.getString("count") ?: record.measurement?.count?.toString().orEmpty())
                 }
+                candidateCount = savedInstanceState?.getBoolean("candidateCount") ?: record.measurement?.candidateCount ?: false
                 countField = count
                 root.addView(count)
                 root.addView(text("比較範囲は脱毛範囲の外側、すぐ近くの同じ向きの頭皮へ。横切る毛ではなく、生え際を確認できる毛を数えます。数えられない写真では本数を空欄にしてください。"))
                 val result = text("")
                 root.addView(result)
-                root.addView(text("楕円による面積の近似です。写真内の割合は撮影距離で変わるため、それだけで経過比較はできません。本数も手動で数えた密度に基づく実験的な推定で、実際に抜けた本数ではありません。cm²への換算・毛の自動検出は未対応です。", 12f))
+                root.addView(text("楕円による面積の近似です。写真内の割合は撮影距離で変わるため、それだけで経過比較はできません。換算値も周囲の入力値に基づく実験的な推定で、実際に抜けた本数ではありません。自動解析で表示する点は生え際の候補です。cm²への換算は未対応です。", 12f))
                 fun measurement(): Measurement {
                     val bald = image.bald ?: error("①脱毛範囲を囲んでください")
                     val raw = count.text.toString().trim()
@@ -70,20 +72,120 @@ class MeasurementActivity : ComponentActivity() {
                         number
                     }
                     if (n != null) require(image.reference != null) { "②比較範囲を囲んでください" }
-                    return Measurement(bald, image.reference, n).also { it.estimate }
+                    return Measurement(bald, image.reference, n, candidateCount).also { it.estimate }
                 }
                 fun refresh() {
                     result.text = runCatching {
                         val m = measurement()
                         val fraction = String.format(Locale.JAPAN, "%.2f", AreaEstimate.fraction(m.bald) * 100)
                         "写真内の面積割合：$fraction%（距離に依存）\n" +
-                            (m.estimate?.let { "推定：約${AreaEstimate.rounded(it)}本分（手動密度）" } ?: "本数推定：比較範囲と本数を入力すると計算します")
+                            (m.estimate?.let { if (m.candidateCount) "候補密度の参考換算：約${AreaEstimate.rounded(it)}個相当（本数未確定）" else "推定：約${AreaEstimate.rounded(it)}本分（手動密度）" } ?: "本数推定：比較範囲と本数を入力すると計算します")
                     }.getOrElse { it.message ?: "範囲を確認してください" }
                 }
-                image.changed = { refresh() }
+                var requestVersion = 0
+                var candidateResult: RootCandidates.Result? = null
+                val analysisStatus = text("自動解析は試作です。点が本当の生え際か確認してください")
+                val propose = Button(this).apply { text = "脱毛範囲と周囲を自動提案" }
+                val analyzeReference = Button(this).apply { text = "選んだ比較範囲を自動カウント" }
+                val accept = Button(this).apply { text = "点を確認して候補数を仮入力"; isEnabled = false }
+                val binary = Switch(this).apply { text = "比較範囲の二値化を表示" }
+                root.addView(propose); root.addView(analyzeReference); root.addView(binary)
+                root.addView(analysisStatus); root.addView(accept)
+                binary.setOnCheckedChangeListener { _, checked -> image.showBinary = checked; image.invalidate() }
+                image.changed = {
+                    requestVersion++
+                    candidateResult = null; image.analysis = null
+                    image.binaryPreview?.recycle(); image.binaryPreview = null
+                    accept.isEnabled = false
+                    count.setText("")
+                    analysisStatus.text = "範囲が変わりました。比較範囲を再解析できます"
+                    refresh()
+                }
+                fun runAnalysis(autoRegion: Boolean) {
+                    if (!autoRegion && image.reference == null) {
+                        analysisStatus.text = "先に②比較範囲を囲んでください"; return
+                    }
+                    val version = ++requestVersion
+                    val reference = image.reference
+                    propose.isEnabled = false; analyzeReference.isEnabled = false; accept.isEnabled = false
+                    candidateResult = null; image.analysis = null
+                    image.binaryPreview?.recycle(); image.binaryPreview = null; image.invalidate()
+                    analysisStatus.text = "解析中…"
+                    worker.execute {
+                        val answer = runCatching {
+                            val longest = maxOf(bitmap.width, bitmap.height)
+                            val w = maxOf(1, bitmap.width * minOf(768, longest) / longest)
+                            val h = maxOf(1, bitmap.height * minOf(768, longest) / longest)
+                            val small = android.graphics.Bitmap.createScaledBitmap(bitmap, w, h, true)
+                            val gray = IntArray(w * h)
+                            small.getPixels(gray, 0, w, 0, 0, w, h)
+                            if (small !== bitmap) small.recycle()
+                            for (i in gray.indices) gray[i] = gray[i] and 255
+                            var suggested: Region? = null
+                            if (autoRegion) {
+                                val dw = maxOf(1, w * 160 / maxOf(160, w, h)); val dh = maxOf(1, h * 160 / maxOf(160, w, h))
+                                val smooth = IntArray(dw * dh) { i ->
+                                    val cx = (i % dw) * w / dw; val cy = (i / dw) * h / dh
+                                    var sum = 0; var n = 0
+                                    for (dy in -2..2) for (dx in -2..2) {
+                                        val x = (cx + dx * w / dw).coerceIn(0, w - 1)
+                                        val y = (cy + dy * h / dh).coerceIn(0, h - 1)
+                                        sum += gray[y * w + x]; n++
+                                    }
+                                    sum / n
+                                }
+                                val patch = ContrastDetector().detect(smooth, dw, dh)
+                                if (patch != null) suggested = Region(patch.left.toDouble() / dw, patch.top.toDouble() / dh,
+                                    patch.right.toDouble() / dw, patch.bottom.toDouble() / dh).takeIf { it.isValid }
+                            }
+                            val roots = if (autoRegion) suggested?.let { RootCandidates.proposeReference(gray, w, h, it) }
+                                else reference?.let { RootCandidates.analyze(gray, w, h, it) }
+                            Pair(suggested, roots)
+                        }
+                        runOnUiThread {
+                            if (isDestroyed) return@runOnUiThread
+                            propose.isEnabled = true; analyzeReference.isEnabled = true
+                            if (version != requestVersion) return@runOnUiThread
+                            answer.onSuccess { (suggested, roots) ->
+                                if (autoRegion) {
+                                    image.bald = suggested ?: image.bald
+                                    image.reference = roots?.region
+                                    count.setText("")
+                                }
+                                image.binaryPreview?.recycle(); image.binaryPreview = null
+                                image.analysis = roots; candidateResult = roots
+                                if (roots != null) {
+                                    image.binaryPreview = android.graphics.Bitmap.createBitmap(
+                                        IntArray(roots.binary.size) { if (roots.binary[it]) android.graphics.Color.BLACK else android.graphics.Color.WHITE },
+                                        roots.width, roots.height, android.graphics.Bitmap.Config.ARGB_8888)
+                                    val countable = roots.visibleSkinFraction >= .5 && roots.points.size in 1..499 &&
+                                        image.bald?.let { !AreaEstimate.overlaps(it, roots.region) } == true
+                                    analysisStatus.text = "生え際候補：${roots.points.size}個（確定本数ではありません）\n" +
+                                        if (countable) "紫の点を確認してください。線の交差や影も候補になることがあります" else "密度の換算には不適です。明るい頭皮と生え際が見える比較範囲を選び直してください"
+                                    accept.isEnabled = countable
+                                } else {
+                                    accept.isEnabled = false
+                                    analysisStatus.text = if (autoRegion && suggested == null) "脱毛範囲を提案できませんでした。手で囲んで比較範囲を解析できます" else "周囲に比較できる場所が見つかりません。②比較範囲を手で指定してください"
+                                }
+                                image.invalidate(); refresh()
+                            }.onFailure { analysisStatus.text = "解析できませんでした。範囲を小さくして試してください" }
+                        }
+                    }
+                }
+                propose.setOnClickListener { runAnalysis(true) }
+                analyzeReference.setOnClickListener { runAnalysis(false) }
+                accept.setOnClickListener {
+                    candidateResult?.let { roots ->
+                        image.reference = roots.region
+                        count.setText(roots.points.size.toString())
+                        candidateCount = true
+                        analysisStatus.text = "候補数を仮入力しました。誤検出を確認して本数を修正してから保存してください"
+                        refresh()
+                    }
+                }
                 count.addTextChangedListener(object : TextWatcher {
                     override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { refresh() }
+                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { candidateCount = false; refresh() }
                     override fun afterTextChanged(s: Editable?) {}
                 })
                 refresh()
@@ -109,6 +211,7 @@ class MeasurementActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         fun save(key: String, region: Region?) { region?.let { outState.putDoubleArray(key, doubleArrayOf(it.left, it.top, it.right, it.bottom)) } }
         save("bald", selection?.bald); save("reference", selection?.reference)
+        outState.putBoolean("candidateCount", candidateCount)
         outState.putString("count", countField?.text?.toString().orEmpty())
         super.onSaveInstanceState(outState)
     }
