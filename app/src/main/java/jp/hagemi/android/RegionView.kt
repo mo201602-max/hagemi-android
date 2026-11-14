@@ -10,6 +10,9 @@ class RegionView(context: Context, private val bitmap: Bitmap) : View(context) {
     var bald: Region? = null
     var reference: Region? = null
     var selectingReference = false
+    var analysis: RootCandidates.Result? = null
+    var binaryPreview: Bitmap? = null
+    var showBinary = false
     var changed: (() -> Unit)? = null
     private val imageRect = RectF()
     private var startX = 0.0
@@ -24,6 +27,15 @@ class RegionView(context: Context, private val bitmap: Bitmap) : View(context) {
         canvas.drawBitmap(bitmap, null, imageRect, null)
         fun rect(region: Region) = RectF(imageRect.left + region.left.toFloat() * w, imageRect.top + region.top.toFloat() * h,
             imageRect.left + region.right.toFloat() * w, imageRect.top + region.bottom.toFloat() * h)
+        analysis?.let { result ->
+            if (showBinary) binaryPreview?.let { canvas.drawBitmap(it, null, rect(result.region), null) }
+            paint.style = Paint.Style.STROKE
+            paint.color = Color.MAGENTA
+            result.points.forEach { point ->
+                canvas.drawCircle(imageRect.left + point.x.toFloat() * w, imageRect.top + point.y.toFloat() * h,
+                    4 * resources.displayMetrics.density, paint)
+            }
+        }
         paint.style = Paint.Style.STROKE
         paint.color = Color.YELLOW
         bald?.let { canvas.drawOval(rect(it), paint) }

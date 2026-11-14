@@ -382,7 +382,8 @@ class MainActivity : ComponentActivity() {
         return BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })
     }
     private fun measurementSummary(value: Measurement) = value.estimate?.let {
-        "推定 約${AreaEstimate.rounded(it)}本分（手動密度）"
+        if (value.candidateCount) "候補密度の参考換算：約${AreaEstimate.rounded(it)}個相当"
+        else "推定 約${AreaEstimate.rounded(it)}本分（手動密度）"
     } ?: "脱毛範囲を記録済み（本数未推定）"
     private fun date(time: Long) = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.JAPAN).format(Date(time))
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()

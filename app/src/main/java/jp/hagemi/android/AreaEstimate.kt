@@ -20,6 +20,6 @@ object AreaEstimate {
     fun rounded(value: Double): Int = value.roundToInt()
 }
 
-data class Measurement(val bald: Region, val reference: Region?, val count: Int?) {
+data class Measurement(val bald: Region, val reference: Region?, val count: Int?, val candidateCount: Boolean = false) {
     val estimate: Double? get() = if (reference != null && count != null) AreaEstimate.missingHairs(bald, reference, count) else null
 }

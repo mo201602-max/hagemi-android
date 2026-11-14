@@ -65,7 +65,7 @@ class RecordStore(context: Context) {
         val bald = region("bald")
         val reference = if (item.has("reference")) region("reference") else null
         val count = if (item.has("count")) item.getInt("count") else null
-        Measurement(bald, reference, count).also { it.estimate }
+        Measurement(bald, reference, count, item.optBoolean("candidateCount", false)).also { it.estimate }
     }.getOrNull()
 
     fun saveMeasurement(record: Record, measurement: Measurement) {
@@ -74,10 +74,11 @@ class RecordStore(context: Context) {
         val metadata = File(folder, "${record.id}.json")
         val json = JSONObject(metadata.readText())
         fun array(region: Region) = org.json.JSONArray(listOf(region.left, region.top, region.right, region.bottom))
-        val item = JSONObject().put("version", 1).put("method", "manual-reference-density")
+        val item = JSONObject().put("version", 1).put("method", if (measurement.candidateCount) "unverified-component-density" else "manual-reference-density")
             .put("bald", array(measurement.bald))
         measurement.reference?.let { item.put("reference", array(it)) }
         measurement.count?.let { item.put("count", it) }
+        item.put("candidateCount", measurement.candidateCount)
         json.put("measurement", item)
         val atomic = android.util.AtomicFile(metadata)
         val output = atomic.startWrite()
