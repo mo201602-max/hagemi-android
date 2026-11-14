@@ -231,7 +231,7 @@ class MainActivity : ComponentActivity() {
                                             val distance = kotlin.math.hypot(
                                                 (box.centerX() - preview.width / 2f) / preview.width,
                                                 (box.centerY() - preview.height / 2f) / preview.height)
-                                            detectionStatus.text = if (distance < 0.10f) "中央です。そのまま動かさずに♡" else "候補の黄色い枠を中央の十字へ"
+                                            detectionStatus.text = if (distance < 0.18f) "中央です。そのまま動かさずに♡" else "候補の黄色い枠を中央の十字へ"
                                             if (automatic.isChecked && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
                                                 val clock = android.os.SystemClock.elapsedRealtime()
                                                 val target = AutoCaptureGate.Target(box.centerX().toDouble() / preview.width,
@@ -240,6 +240,7 @@ class MainActivity : ComponentActivity() {
                                                 latestTarget = target
                                                 lastSeen = now
                                                 ready = gate.update(target, now)
+                                                detectionStatus.text = if (focusing) "ピントを調整中…このまま♡" else gate.status
                                                 if (clock - lastTone >= AutoCaptureGate.interval(distance.toDouble())) {
                                                     sonar?.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 70)
                                                     lastTone = clock
@@ -249,17 +250,16 @@ class MainActivity : ComponentActivity() {
                                                     val generation = ++focusGeneration
                                                     val focusedTarget = target
                                                     val point = preview.meteringPointFactory.createPoint(box.centerX(), box.centerY())
-                                                    val focus = focusCamera?.cameraControl?.startFocusAndMetering(
-                                                        FocusMeteringAction.Builder(point).setAutoCancelDuration(2, java.util.concurrent.TimeUnit.SECONDS).build())
+                                                    val focus = runCatching { focusCamera?.cameraControl?.startFocusAndMetering(
+                                                        FocusMeteringAction.Builder(point).setAutoCancelDuration(2, java.util.concurrent.TimeUnit.SECONDS).build()) }.getOrNull()
                                                     detectionStatus.text = "ピントを確認中…"
-                                                    focus?.addListener({
-                                                        if (generation != focusGeneration) return@addListener
-                                                        focusing = false
+                                                    fun finishFocus() {
+                                                        if (generation != focusGeneration) return
                                                         val current = latestTarget
-                                                        val sameTarget = current != null && kotlin.math.hypot(current.x - focusedTarget.x, current.y - focusedTarget.y) < .03 &&
-                                                            kotlin.math.abs(current.area - focusedTarget.area) / focusedTarget.area.coerceAtLeast(.0001) < .2
-                                                        val success = runCatching { focus.get().isFocusSuccessful }.getOrDefault(false)
-                                                        if (success && sameTarget && ready && automatic.isChecked && cameraScreen &&
+                                                        val sameTarget = current != null && kotlin.math.hypot(current.x - focusedTarget.x, current.y - focusedTarget.y) < .10 &&
+                                                            kotlin.math.abs(current.area - focusedTarget.area) / focusedTarget.area.coerceAtLeast(.0001) < .75 &&
+                                                            kotlin.math.hypot(current.x - .5, current.y - .5) <= .18
+                                                        if (sameTarget && automatic.isChecked && cameraScreen &&
                                                             preview.isAttachedToWindow && !busy && !isDestroyed &&
                                                             lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
                                                             android.os.SystemClock.elapsedRealtime() - lastSeen < 450) {
@@ -267,10 +267,16 @@ class MainActivity : ComponentActivity() {
                                                             shutter.performClick()
                                                         } else {
                                                             resetGuidance()
-                                                            detectionStatus.text = "もう一度、中央で止めてね。手動撮影も使えます"
+                                                            detectionStatus.text = "位置が変わりました。もう一度ガイドの中へ"
                                                         }
+                                                    }
+                                                    // Skin often cannot satisfy the device's AF-success flag.
+                                                    // Allow a bounded settling period, then use fresh positional checks.
+                                                    preview.postDelayed({ finishFocus() }, 1400)
+                                                    focus?.addListener({
+                                                        if (generation != focusGeneration) return@addListener
+                                                        if (runCatching { focus.get().isFocusSuccessful }.getOrDefault(false)) finishFocus()
                                                     }, ContextCompat.getMainExecutor(this))
-                                                    if (focus == null) { resetGuidance() }
                                                 }
                                             }
                                         } else { resetGuidance(); overlay.update(null); detectionStatus.text = "候補を探しています…" }
