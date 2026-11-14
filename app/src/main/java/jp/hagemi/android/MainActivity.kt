@@ -43,6 +43,9 @@ class MainActivity : ComponentActivity() {
     private val shutterSound = android.media.MediaActionSound()
     override fun onStop() { stopGuidance?.invoke(); super.onStop() }
     override fun onDestroy() { sonar?.release(); shutterSound.release(); super.onDestroy() }
+    private val measurementScreen = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) showTimeline()
+    }
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) showCamera() else {
             toast("撮影にはカメラの許可が必要です。端末の設定から変更できます")
@@ -113,12 +116,16 @@ class MainActivity : ComponentActivity() {
         val picture = ImageView(this).apply { adjustViewBounds = true }
         panel.addView(picture, LinearLayout.LayoutParams(-1, dp(320)))
         panel.addView(label(record.note.ifBlank { "メモなし" }))
+        record.measurement?.let { panel.addView(label(measurementSummary(it), 12f)) }
         val dialog = AlertDialog.Builder(this).setTitle(date(record.time)).setView(panel)
             .setPositiveButton("閉じる", null).setNegativeButton("削除") { _, _ ->
                 AlertDialog.Builder(this).setMessage("この写真とメモを削除しますか？")
                     .setPositiveButton("削除する") { _, _ -> worker.execute { store.delete(record); runOnUiThread { if (!isDestroyed) showTimeline() } } }
                     .setNegativeButton("戻る", null).show()
             }.create()
+        dialog.setButton(AlertDialog.BUTTON_NEUTRAL, "サイズ推定") { _, _ ->
+            measurementScreen.launch(android.content.Intent(this, MeasurementActivity::class.java).putExtra("recordId", record.id))
+        }
         dialog.show()
         worker.execute {
             val image = thumbnail(record.photo, 1200)
@@ -358,7 +365,8 @@ class MainActivity : ComponentActivity() {
             val record = records[position]
             val image = row.getChildAt(0) as ImageView
             image.tag = record.id; image.setImageDrawable(null)
-            (row.getChildAt(1) as TextView).text = getString(R.string.record_summary, date(record.time), record.note.ifBlank { "今日の1枚 ♡" })
+            (row.getChildAt(1) as TextView).text = getString(R.string.record_summary, date(record.time),
+                (record.measurement?.let { "${measurementSummary(it)}\n" } ?: "") + record.note.ifBlank { "今日の1枚 ♡" })
             worker.execute {
                 val bitmap = thumbnail(record.photo, 240)
                 runOnUiThread { if (!isDestroyed && image.tag == record.id) image.setImageBitmap(bitmap) }
@@ -373,6 +381,9 @@ class MainActivity : ComponentActivity() {
         while (maxOf(options.outWidth, options.outHeight) / sample > edge) sample *= 2
         return BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })
     }
+    private fun measurementSummary(value: Measurement) = value.estimate?.let {
+        "推定 約${AreaEstimate.rounded(it)}本分（手動密度）"
+    } ?: "脱毛範囲を記録済み（本数未推定）"
     private fun date(time: Long) = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.JAPAN).format(Date(time))
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_LONG).show()
