@@ -17,6 +17,9 @@ class MeasurementActivity : ComponentActivity() {
     private var countField: EditText? = null
     private var candidateCount = false
     private var meshEstimate: MeshEstimate? = null
+    private val hairReviewScreen = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK) setResult(Activity.RESULT_OK)
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
@@ -34,7 +37,13 @@ class MeasurementActivity : ComponentActivity() {
         worker.execute {
             val store = RecordStore(this)
             val record = store.list().find { it.id == intent.getStringExtra("recordId") }
-            val bitmap = record?.let { BitmapFactory.decodeFile(it.photo.path) }
+            val reviewedArea = record?.let { store.loadHairReview(it)?.bald }
+            val bitmap = record?.let {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(it.photo.path, bounds)
+                var sample = 1; while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 1200) sample *= 2
+                BitmapFactory.decodeFile(it.photo.path, BitmapFactory.Options().apply { inSampleSize = sample })
+            }
             runOnUiThread {
                 if (isDestroyed) { bitmap?.recycle(); return@runOnUiThread }
                 if (record == null || bitmap == null) { status.text = "写真を読み込めませんでした"; return@runOnUiThread }
@@ -51,9 +60,18 @@ class MeasurementActivity : ComponentActivity() {
                     else record.measurement?.mesh
                 image.meshEstimate = meshEstimate
                 fun savedRegion(key: String): Region? = savedInstanceState?.getDoubleArray(key)?.let { Region(it[0], it[1], it[2], it[3]) }
-                image.bald = savedRegion("bald") ?: record.measurement?.bald
+                image.bald = savedRegion("bald") ?: record.measurement?.bald ?: reviewedArea
                 image.reference = savedRegion("reference") ?: record.measurement?.reference
                 root.addView(image, LinearLayout.LayoutParams(-1, (360 * resources.displayMetrics.density).toInt()))
+                root.addView(Button(this).apply {
+                    text = "生え際候補を追跡して確認"
+                    setOnClickListener {
+                        val bald = image.bald
+                        if (bald == null) { Toast.makeText(this@MeasurementActivity, "先に脱毛範囲を黄色い楕円で囲んでください", Toast.LENGTH_LONG).show() }
+                        else hairReviewScreen.launch(android.content.Intent(this@MeasurementActivity, HairReviewActivity::class.java)
+                            .putExtra("recordId", record.id).putExtra("bald", doubleArrayOf(bald.left, bald.top, bald.right, bald.bottom)))
+                    }
+                })
                 modes.setOnCheckedChangeListener { _, checked -> image.selectingReference = checked == referenceMode.id }
                 val count = EditText(this).apply {
                     hint = "比較範囲で確認できた毛の本数（任意）"
