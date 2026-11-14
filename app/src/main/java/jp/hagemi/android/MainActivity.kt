@@ -46,6 +46,31 @@ class MainActivity : ComponentActivity() {
     private val measurementScreen = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) showTimeline()
     }
+    private val importPhoto = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) {
+            busy = true; showTimeline()
+            worker.execute {
+                val outcome = runCatching {
+                    val temp = File.createTempFile("photo-import-", ".image", cacheDir)
+                    try {
+                        requireNotNull(contentResolver.openInputStream(uri)).use { input -> temp.outputStream().use { output ->
+                            val buffer = ByteArray(64 * 1024); var total = 0L
+                            while (true) {
+                                val n = input.read(buffer); if (n < 0) break
+                                total += n; require(total <= 32L * 1024 * 1024) { "32MB以下の写真を選んでください" }
+                                output.write(buffer, 0, n)
+                            }
+                        } }
+                        store.save(temp, "")
+                    } finally { temp.delete() }
+                }
+                runOnUiThread { busy = false; if (!isDestroyed) {
+                    toast(if (outcome.isSuccess) "写真を白黒で取り込みました" else "写真を取り込めませんでした。画像形式・空き容量を確認してください")
+                    if (!cameraScreen) showTimeline()
+                } }
+            }
+        }
+    }
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) showCamera() else {
             toast("撮影にはカメラの許可が必要です。端末の設定から変更できます")
@@ -94,7 +119,11 @@ class MainActivity : ComponentActivity() {
         root.addView(button("＋ 白黒で撮影する") {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) showCamera()
             else permission.launch(Manifest.permission.CAMERA)
-        })
+        }.apply { isEnabled = !busy })
+        root.addView(button("写真を取り込む") {
+            importPhoto.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        }.apply { isEnabled = !busy })
+        if (busy) root.addView(label("写真を処理しています…", 12f))
         root.addView(label("わたしの記録", 20f))
         root.addView(label("写真はこの端末のアプリ内に保存されます。\nアプリを削除すると記録も消えます。", 12f))
         val list = ListView(this).apply { dividerHeight = dp(12) }
@@ -117,12 +146,17 @@ class MainActivity : ComponentActivity() {
         panel.addView(picture, LinearLayout.LayoutParams(-1, dp(320)))
         panel.addView(label(record.note.ifBlank { "メモなし" }))
         record.measurement?.let { panel.addView(label(measurementSummary(it), 12f)) }
+        record.hairSummary?.let { panel.addView(label(it.text, 12f)) }
         val dialog = AlertDialog.Builder(this).setTitle(date(record.time)).setView(panel)
             .setPositiveButton("閉じる", null).setNegativeButton("削除") { _, _ ->
                 AlertDialog.Builder(this).setMessage("この写真とメモを削除しますか？")
                     .setPositiveButton("削除する") { _, _ -> worker.execute { store.delete(record); runOnUiThread { if (!isDestroyed) showTimeline() } } }
                     .setNegativeButton("戻る", null).show()
             }.create()
+        if (record.hairSummary != null) panel.addView(button("生え際の判定を見る") {
+            dialog.dismiss()
+            measurementScreen.launch(android.content.Intent(this, HairReviewActivity::class.java).putExtra("recordId", record.id))
+        })
         dialog.setButton(AlertDialog.BUTTON_NEUTRAL, "サイズ推定") { _, _ ->
             measurementScreen.launch(android.content.Intent(this, MeasurementActivity::class.java).putExtra("recordId", record.id))
         }
@@ -193,7 +227,7 @@ class MainActivity : ComponentActivity() {
                 val cameraPreview = Preview.Builder().build().also { it.setSurfaceProvider(preview.surfaceProvider) }
                 capture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .setResolutionSelector(ResolutionSelector.Builder().setResolutionStrategy(
-                        ResolutionStrategy(android.util.Size(1280, 960), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+                        ResolutionStrategy(android.util.Size(3000, 2250), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
                     ).build()).build()
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -366,7 +400,7 @@ class MainActivity : ComponentActivity() {
             val image = row.getChildAt(0) as ImageView
             image.tag = record.id; image.setImageDrawable(null)
             (row.getChildAt(1) as TextView).text = getString(R.string.record_summary, date(record.time),
-                (record.measurement?.let { "${measurementSummary(it)}\n" } ?: "") + record.note.ifBlank { "今日の1枚 ♡" })
+                (record.hairSummary?.let { "${it.text}\n" } ?: "") + (record.measurement?.let { "${measurementSummary(it)}\n" } ?: "") + record.note.ifBlank { "今日の1枚 ♡" })
             worker.execute {
                 val bitmap = thumbnail(record.photo, 240)
                 runOnUiThread { if (!isDestroyed && image.tag == record.id) image.setImageBitmap(bitmap) }
