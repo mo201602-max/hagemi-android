@@ -12,6 +12,9 @@ class DetectionOverlay(context: Context) : View(context) {
         super.onDraw(canvas)
         paint.color = Color.WHITE
         val cx = width / 2f; val cy = height / 2f
+        paint.color = Color.argb(160, 255, 255, 255)
+        canvas.drawOval(cx - width * .18f, cy - height * .18f, cx + width * .18f, cy + height * .18f, paint)
+        paint.color = Color.WHITE
         canvas.drawLine(cx - 16, cy, cx + 16, cy, paint)
         canvas.drawLine(cx, cy - 16, cx, cy + 16, paint)
         box?.let {
