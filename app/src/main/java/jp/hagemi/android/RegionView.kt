@@ -13,6 +13,8 @@ class RegionView(context: Context, private val bitmap: Bitmap) : View(context) {
     var analysis: RootCandidates.Result? = null
     var binaryPreview: Bitmap? = null
     var showBinary = false
+    var spacingResult: BoundarySpacing.Result? = null
+    var meshEstimate: MeshEstimate? = null
     var changed: (() -> Unit)? = null
     private val imageRect = RectF()
     private var startX = 0.0
@@ -35,6 +37,35 @@ class RegionView(context: Context, private val bitmap: Bitmap) : View(context) {
                 canvas.drawCircle(imageRect.left + point.x.toFloat() * w, imageRect.top + point.y.toFloat() * h,
                     4 * resources.displayMetrics.density, paint)
             }
+        }
+        val mesh = meshEstimate
+        val area = bald
+        if (mesh != null && area != null && mesh.amount(area) <= 1500) {
+            val bounds = rect(area)
+            val pitch = (mesh.spacing * kotlin.math.sqrt(bitmap.width.toDouble() * bitmap.height) * scale).toFloat()
+            if (pitch >= 1f) {
+                canvas.save()
+                canvas.clipPath(Path().apply { addOval(bounds, Path.Direction.CW) })
+                paint.color = Color.argb(160, 0, 210, 255)
+                paint.style = Paint.Style.STROKE; paint.strokeWidth = resources.displayMetrics.density
+                val dy = pitch * .8660254f
+                val rows = (bounds.height() / dy).toInt() + 2
+                val cols = (bounds.width() / pitch).toInt() + 3
+                for (row in -1..rows) for (col in -1..cols) {
+                    val x = bounds.left + col * pitch + if (row % 2 == 0) 0f else pitch / 2
+                    val y = bounds.top + row * dy
+                    canvas.drawLine(x, y, x + pitch, y, paint)
+                    canvas.drawLine(x, y, x + pitch / 2, y + dy, paint)
+                    canvas.drawLine(x, y, x - pitch / 2, y + dy, paint)
+                }
+                canvas.restore()
+            }
+        }
+        paint.strokeWidth = 3 * resources.displayMetrics.density
+        paint.color = Color.GREEN; paint.style = Paint.Style.STROKE
+        spacingResult?.points?.forEach { point ->
+            canvas.drawCircle(imageRect.left + point.x.toFloat() * w, imageRect.top + point.y.toFloat() * h,
+                4 * resources.displayMetrics.density, paint)
         }
         paint.style = Paint.Style.STROKE
         paint.color = Color.YELLOW
