@@ -154,7 +154,7 @@ class HairReviewActivity:ComponentActivity() {
             if(request!=previewVersion)return@execute
             val result=runCatching {
                 if(detail) {
-                    val radius=(maxOf(photoW,photoH)/3000f*100).toInt().coerceAtLeast(40)
+                    val radius=(maxOf(photoW,photoH)/3000f*100).toInt().coerceIn(40, 300)
                     val x=(c!!.point.x*photoW).toInt();val y=(c.point.y*photoH).toInt()
                     val crop=Rect(maxOf(0,x-radius),maxOf(0,y-radius),minOf(photoW,x+radius),minOf(photoH,y+radius))
                     val decoder=requireNotNull(BitmapRegionDecoder.newInstance(photo.photo.path,false))
