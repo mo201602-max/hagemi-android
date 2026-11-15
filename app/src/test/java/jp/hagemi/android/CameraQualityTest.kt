@@ -26,4 +26,11 @@ class CameraQualityTest {
         assertSame(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY,fallback.resolutionSelector!!.resolutionStrategy)
         assertEquals(ResolutionSelector.PREFER_CAPTURE_RATE_OVER_HIGHER_RESOLUTION,fallback.resolutionSelector!!.allowedResolutionMode)
     }
+    @Test fun autofocusKeepsItsLockAndLeavesExposureMeteringUnchanged() {
+        val point=androidx.camera.core.SurfaceOrientedMeteringPointFactory(640f,480f).createPoint(320f,240f,.1f)
+        val action=CameraQuality.focusAction(point)
+        assertEquals(1,action.meteringPointsAf.size)
+        assertTrue(action.meteringPointsAe.isEmpty());assertTrue(action.meteringPointsAwb.isEmpty())
+        assertEquals(0L,action.autoCancelDurationInMillis)
+    }
 }
