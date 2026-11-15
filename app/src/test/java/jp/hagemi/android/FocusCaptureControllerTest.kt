@@ -108,4 +108,48 @@ class FocusCaptureControllerTest {
         f.frame(1300);f.frame(1500);f.now=1700;f.subject.observe(null,1700);f.tick(1800)
         assertEquals(FocusCaptureController.State.FOCUSING,f.subject.state)
     }
+    private fun prepareSettling():Fixture {
+        val f=Fixture();f.subject.automaticSettleMillis=700;f.start();f.callbacks.last()(true)
+        f.frame(1400);f.frame(1600);f.frame(1800)
+        assertEquals(FocusCaptureController.State.SETTLING,f.subject.state)
+        return f
+    }
+    @Test fun handsFreeWaitsForContinuedDetailAfterTheHoldInstruction() {
+        val f=prepareSettling();f.frame(2000);f.frame(2200);f.frame(2400)
+        assertFalse(f.events.contains("capture"));f.frame(2600)
+        assertEquals(FocusCaptureController.State.CAPTURING,f.subject.state)
+        assertEquals(listOf("capture"),f.events)
+    }
+    @Test fun blurDuringTheHoldRestartsTheWait() {
+        val f=prepareSettling();f.frame(2000,FocusTexture.Detail(20f,1f,.01f))
+        assertEquals(FocusCaptureController.State.FOCUSING,f.subject.state)
+        f.frame(2200);f.frame(2400)
+        assertEquals(FocusCaptureController.State.SETTLING,f.subject.state)
+        f.frame(2600);f.frame(2800);f.frame(3000);assertFalse(f.events.contains("capture"))
+        f.frame(3200);assertTrue(f.events.contains("capture"))
+    }
+    @Test fun aHoldCannotFinishWithAStalledCameraStream() {
+        val f=prepareSettling();f.tick(2600)
+        assertEquals(FocusCaptureController.State.FOCUSING,f.subject.state)
+        assertFalse(f.events.contains("capture"))
+    }
+    @Test fun cancellingTheHoldNeverTakesThePendingPhoto() {
+        val f=prepareSettling();f.subject.cancel()
+        for(t in 2000L..3400L step 200)f.frame(t)
+        assertEquals(FocusCaptureController.State.IDLE,f.subject.state);assertFalse(f.events.contains("capture"))
+    }
+    @Test fun qualityBasedFallbackStillWaitsBeforeHandsFreeCapture() {
+        val f=Fixture();f.subject.automaticSettleMillis=700;f.start()
+        for(t in 1400L..2400L step 200)f.frame(t)
+        assertEquals(FocusCaptureController.State.SETTLING,f.subject.state)
+        f.frame(2600);f.frame(2800);f.frame(3000);assertFalse(f.events.contains("capture"))
+        f.frame(3200);assertTrue(f.events.contains("capture"))
+    }
+    @Test fun extraHandsFreeHoldDoesNotDelayManualAndTapModes() {
+        for(mode in listOf(FocusCaptureController.Mode.MANUAL,FocusCaptureController.Mode.TAP)) {
+            val f=Fixture();f.subject.automaticSettleMillis=700;f.start(mode);f.callbacks.last()(true)
+            f.frame(1400);f.frame(1600);f.frame(1800)
+            assertEquals(if(mode==FocusCaptureController.Mode.TAP)FocusCaptureController.State.HOLDING else FocusCaptureController.State.CAPTURING,f.subject.state)
+        }
+    }
 }
