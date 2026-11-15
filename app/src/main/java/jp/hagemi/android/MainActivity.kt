@@ -10,7 +10,6 @@ import android.widget.*
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
-import androidx.camera.core.resolutionselector.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -65,7 +64,8 @@ class MainActivity : ComponentActivity() {
                     } finally { temp.delete() }
                 }
                 runOnUiThread { busy = false; if (!isDestroyed) {
-                    toast(if (outcome.isSuccess) "写真を白黒で取り込みました" else "写真を取り込めませんでした。画像形式・空き容量を確認してください")
+                    toast(outcome.getOrNull()?.let { "写真を白黒で取り込みました\n${it.resolution?.text.orEmpty()}" }
+                        ?: "写真を取り込めませんでした。画像形式・空き容量を確認してください")
                     if (!cameraScreen) showTimeline()
                 } }
             }
@@ -144,6 +144,8 @@ class MainActivity : ComponentActivity() {
         val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), 0, dp(16), 0) }
         val picture = ImageView(this).apply { adjustViewBounds = true }
         panel.addView(picture, LinearLayout.LayoutParams(-1, dp(320)))
+        val photoSize = label(record.resolution?.text ?: "写真のサイズを確認中…", 12f)
+        panel.addView(photoSize)
         panel.addView(label(record.note.ifBlank { "メモなし" }))
         record.measurement?.let { panel.addView(label(measurementSummary(it), 12f)) }
         record.hairSummary?.let { panel.addView(label(it.text, 12f)) }
@@ -163,7 +165,11 @@ class MainActivity : ComponentActivity() {
         dialog.show()
         worker.execute {
             val image = thumbnail(record.photo, 1200)
-            runOnUiThread { if (dialog.isShowing) picture.setImageBitmap(image) }
+            val dimensions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(record.photo.path, dimensions)
+            val sizeText = if (dimensions.outWidth > 0) "保存：${dimensions.outWidth} × ${dimensions.outHeight} px" +
+                (record.resolution?.takeIf { it.reduced }?.let { "（元：${it.sourceWidth} × ${it.sourceHeight} px）" } ?: "") else "写真のサイズを読み込めませんでした"
+            runOnUiThread { if (dialog.isShowing) { picture.setImageBitmap(image); photoSize.text = sizeText } }
         }
     }
 
@@ -176,6 +182,7 @@ class MainActivity : ComponentActivity() {
         val detectionStatus = label("検出の準備中…", 14f)
         val preview = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            scaleType = PreviewView.ScaleType.FIT_CENTER
             setLayerType(View.LAYER_TYPE_HARDWARE, Paint().apply {
                 colorFilter = ColorMatrixColorFilter(ColorMatrix().apply { setSaturation(0f) })
             })
@@ -186,6 +193,8 @@ class MainActivity : ComponentActivity() {
             addView(overlay, FrameLayout.LayoutParams(-1, -1))
         }
         root.addView(cameraFrame, LinearLayout.LayoutParams(-1, 0, 1f))
+        val qualityStatus = label("撮影サイズを確認中…", 12f)
+        root.addView(qualityStatus)
         root.addView(detectionStatus)
         val automatic = Switch(this).apply { text = "ソナー音・自動撮影" }
         root.addView(automatic)
@@ -224,16 +233,9 @@ class MainActivity : ComponentActivity() {
             if (!cameraScreen || isDestroyed) return@addListener
             try {
                 provider = future.get()
-                val cameraPreview = Preview.Builder().build().also { it.setSurfaceProvider(preview.surfaceProvider) }
-                capture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                    .setResolutionSelector(ResolutionSelector.Builder().setResolutionStrategy(
-                        ResolutionStrategy(android.util.Size(3000, 2250), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
-                    ).build()).build()
-                val analysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setResolutionSelector(ResolutionSelector.Builder().setResolutionStrategy(
-                        ResolutionStrategy(android.util.Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
-                    ).build()).build()
+                val cameraPreview = CameraQuality.preview().also { it.setSurfaceProvider(preview.surfaceProvider) }
+                capture = CameraQuality.capture()
+                val analysis = CameraQuality.analysis()
                 val detector = ContrastDetector()
                 var lastFrame = 0L
                 analysis.setAnalyzer(analysisWorker) { image ->
@@ -334,17 +336,27 @@ class MainActivity : ComponentActivity() {
                     } finally { image.close() }
                 }
                 provider!!.unbindAll()
-                val group = UseCaseGroup.Builder().addUseCase(cameraPreview).addUseCase(capture!!).addUseCase(analysis)
-                preview.viewPort?.let { group.setViewPort(it) }
+                fun cameraGroup() = UseCaseGroup.Builder().addUseCase(cameraPreview).addUseCase(capture!!).addUseCase(analysis)
+                    .setViewPort(ViewPort.Builder(android.util.Rational(preview.width, preview.height), preview.display.rotation)
+                        .setScaleType(ViewPort.FIT).build()).build()
                 try {
-                    focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, group.build())
+                    focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraGroup())
                 } catch (error: IllegalArgumentException) {
-                    analysis.clearAnalyzer()
-                    automatic.isEnabled = false
                     provider!!.unbindAll()
-                    provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraPreview, capture)
-                    detectionStatus.text = "この端末では検出を起動できません。手動撮影は使えます"
+                    capture = CameraQuality.capture(includeSlowHighResolution = false)
+                    try {
+                        focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraGroup())
+                    } catch (standardError: IllegalArgumentException) {
+                        analysis.clearAnalyzer(); automatic.isEnabled = false
+                        provider!!.unbindAll()
+                        provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraPreview, capture)
+                        detectionStatus.text = "この端末では検出を起動できません。手動撮影は使えます"
+                    }
                 }
+                val stillSize = capture?.resolutionInfo?.cropRect
+                val searchSize = analysis.resolutionInfo?.resolution
+                qualityStatus.text = stillSize?.let { "撮影：${it.width()} × ${it.height()} px" }.orEmpty() +
+                    (searchSize?.let { " ／ サーチ：${it.width} × ${it.height}" } ?: "")
                 shutter.text = "● 撮影して保存"
                 shutter.isEnabled = true
                 shutter.setOnClickListener {
@@ -365,8 +377,8 @@ class MainActivity : ComponentActivity() {
                         object : ImageCapture.OnImageSavedCallback {
                             override fun onImageSaved(result: ImageCapture.OutputFileResults) {
                                 try {
-                                    store.save(temp, memo)
-                                    runOnUiThread { busy = false; if (!isDestroyed) { toast("記録できたじゃん♡"); showTimeline() } }
+                                    val record = store.save(temp, memo)
+                                    runOnUiThread { busy = false; if (!isDestroyed) { toast("記録できたじゃん♡\n${record.resolution?.text.orEmpty()}"); showTimeline() } }
                                 } catch (error: Exception) { failed() } finally { temp.delete() }
                             }
                             override fun onError(error: ImageCaptureException) { temp.delete(); failed() }

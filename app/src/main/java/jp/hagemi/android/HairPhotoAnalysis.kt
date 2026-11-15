@@ -7,19 +7,25 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.*
 
 object HairPhotoAnalysis {
+    internal data class TileLayout(val scale: Float, val halo: Int, val coreEdge: Int)
+    internal fun tileLayout(width: Int, height: Int): TileLayout {
+        val scale = (max(width, height) / 3000f).coerceIn(.05f, 2f)
+        val halo = max(16, (192 * scale).roundToInt())
+        return TileLayout(scale, halo, min(512, 1000 - 2 * halo))
+    }
     @Suppress("DEPRECATION")
     fun analyze(file: File, bald: Region, cancelled: AtomicBoolean, progress: (Int, Int) -> Unit): HairReview {
         require(bald.isValid)
         val decoder = requireNotNull(BitmapRegionDecoder.newInstance(file.path, false))
         try {
-            val w=decoder.width;val h=decoder.height;val scale=(max(w,h)/3000f).coerceIn(.05f,1f)
+            val w=decoder.width;val h=decoder.height;val layout=tileLayout(w,h);val scale=layout.scale
             val cx=(bald.left+bald.right)/2*w;val cy=(bald.top+bald.bottom)/2*h
             val rx=(bald.right-bald.left)/2*w;val ry=(bald.bottom-bald.top)/2*h
             val left=floor(cx-rx*1.5).toInt().coerceAtLeast(0);val top=floor(cy-ry*1.5).toInt().coerceAtLeast(0)
             val right=ceil(cx+rx*1.5).toInt().coerceAtMost(w);val bottom=ceil(cy+ry*1.5).toInt().coerceAtMost(h)
             val cores=ArrayList<Rect>()
-            for(y in top until bottom step 512)for(x in left until right step 512) {
-                val r=Rect(x,y,min(right,x+512),min(bottom,y+512))
+            for(y in top until bottom step layout.coreEdge)for(x in left until right step layout.coreEdge) {
+                val r=Rect(x,y,min(right,x+layout.coreEdge),min(bottom,y+layout.coreEdge))
                 val nearestX=(cx.coerceIn(r.left.toDouble(),r.right.toDouble())-cx)/rx
                 val nearestY=(cy.coerceIn(r.top.toDouble(),r.bottom.toDouble())-cy)/ry
                 val maxX=max(abs(r.left-cx),abs(r.right-cx))/rx;val maxY=max(abs(r.top-cy),abs(r.bottom-cy))/ry
@@ -30,7 +36,7 @@ object HairPhotoAnalysis {
             for((i,core) in cores.withIndex()) {
                 if(cancelled.get())throw CancellationException()
                 progress(i+1,cores.size)
-                val halo=max(16,(192*scale).roundToInt())
+                val halo=layout.halo
                 val bounds=Rect(max(0,core.left-halo),max(0,core.top-halo),min(w,core.right+halo),min(h,core.bottom+halo))
                 val bitmap=requireNotNull(decoder.decodeRegion(bounds,BitmapFactory.Options()))
                 val gray=ByteArray(bitmap.width*bitmap.height);val band=IntArray(bitmap.width*16)

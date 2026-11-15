@@ -14,8 +14,11 @@ import org.robolectric.util.ReflectionHelpers
 class PixelRegionDecoder {
     private var image:Bitmap?=null
     companion object {
+        @JvmField var rejectRegions = false
+        @JvmField var largestRegionPixels = 0L
         @JvmStatic @Implementation
         fun newInstance(pathName:String,isShareable:Boolean):BitmapRegionDecoder {
+            if (rejectRegions) throw java.io.IOException("Test-only unsupported region format")
             val result=ReflectionHelpers.callConstructor(BitmapRegionDecoder::class.java,ReflectionHelpers.ClassParameter.from(Long::class.javaPrimitiveType!!,0L))
             Shadow.extract<PixelRegionDecoder>(result).image=requireNotNull(BitmapFactory.decodeFile(pathName))
             return result
@@ -24,6 +27,7 @@ class PixelRegionDecoder {
     @Implementation fun getWidth()=requireNotNull(image).width
     @Implementation fun getHeight()=requireNotNull(image).height
     @Implementation fun decodeRegion(rect:Rect,options:BitmapFactory.Options):Bitmap {
+        largestRegionPixels = maxOf(largestRegionPixels, rect.width().toLong() * rect.height())
         val source=requireNotNull(image);val sample=options.inSampleSize.coerceAtLeast(1)
         val w=(rect.width()+sample-1)/sample;val h=(rect.height()+sample-1)/sample
         return Bitmap.createBitmap(w,h,Bitmap.Config.ARGB_8888).also {out->

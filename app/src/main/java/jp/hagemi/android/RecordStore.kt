@@ -5,7 +5,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
-data class Record(val id: String, val time: Long, val note: String, val photo: File, val measurement: Measurement? = null, val hairSummary: HairReviewSummary? = null)
+data class Record(val id: String, val time: Long, val note: String, val photo: File, val measurement: Measurement? = null,
+                  val hairSummary: HairReviewSummary? = null, val resolution: PhotoResolution? = null)
 
 /** All records stay in app-private storage. No network or shared gallery access. */
 class RecordStore(context: Context) {
@@ -14,26 +15,35 @@ class RecordStore(context: Context) {
     fun list(): List<Record> = folder.listFiles().orEmpty().filter { it.extension == "json" && !it.name.endsWith(".roots.json") }.mapNotNull { file ->
         runCatching {
             val json = JSONObject(file.readText())
-            val photo = File(folder, "${file.nameWithoutExtension}.jpg")
-            if (!photo.exists()) null else Record(file.nameWithoutExtension, json.getLong("time"), json.optString("note"), photo, readMeasurement(json), readHairSummary(json))
+            val png = File(folder, "${file.nameWithoutExtension}.png")
+            val photo = if (png.exists()) png else File(folder, "${file.nameWithoutExtension}.jpg")
+            if (!photo.exists()) null else Record(file.nameWithoutExtension, json.getLong("time"), json.optString("note"), photo,
+                readMeasurement(json), readHairSummary(json), readResolution(json))
         }.getOrNull()
     }.sortedByDescending { it.time }
 
     fun save(source: File, note: String): Record {
         val id = UUID.randomUUID().toString()
-        val photo = File(folder, "$id.jpg")
+        val photo = File(folder, "$id.png")
         val metadata = File(folder, "$id.json")
         try {
-            val memory = contextMemoryBudget
-            PhotoProcessor.saveGrayscale(source, photo, memory)
+            val resolution = PhotoProcessor.saveGrayscale(source, photo, contextMemoryBudget)
             val time = System.currentTimeMillis()
-            metadata.writeText(JSONObject().put("time", time).put("note", note).toString())
-            return Record(id, time, note, photo)
+            metadata.writeText(JSONObject().put("time", time).put("note", note).put("resolution", JSONObject()
+                .put("sourceWidth", resolution.sourceWidth).put("sourceHeight", resolution.sourceHeight)
+                .put("width", resolution.width).put("height", resolution.height)).toString())
+            return Record(id, time, note, photo, resolution = resolution)
         } catch (error: Exception) {
             photo.delete(); metadata.delete(); throw error
         }
     }
-    private val contextMemoryBudget = if ((context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).let { it.isLowRamDevice || it.memoryClass < 192 }) 4_000_000 else 9_000_000
+    private val contextMemoryBudget = if ((context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).let { it.isLowRamDevice || it.memoryClass < 192 }) 1_000_000 else 4_000_000
+    private fun readResolution(json: JSONObject): PhotoResolution? = runCatching {
+        val item = json.optJSONObject("resolution") ?: return null
+        PhotoResolution(item.getInt("sourceWidth"), item.getInt("sourceHeight"), item.getInt("width"), item.getInt("height")).also {
+            require(it.sourceWidth > 0 && it.sourceHeight > 0 && it.width > 0 && it.height > 0)
+        }
+    }.getOrNull()
     private fun readHairSummary(json: JSONObject): HairReviewSummary? = runCatching {
         val item = json.optJSONObject("hairSummary") ?: return null
         HairReviewSummary(item.getInt("total"), item.getInt("confirmed"), item.getInt("hold"), item.getInt("rejected")).also {
