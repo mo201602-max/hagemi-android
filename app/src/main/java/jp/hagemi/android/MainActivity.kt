@@ -40,8 +40,11 @@ class MainActivity : ComponentActivity() {
     private var stopGuidance: (() -> Unit)? = null
     private var sonar: android.media.ToneGenerator? = null
     private val shutterSound = android.media.MediaActionSound()
-    override fun onStop() { stopGuidance?.invoke(); super.onStop() }
-    override fun onDestroy() { sonar?.release(); shutterSound.release(); super.onDestroy() }
+    private var speech: android.speech.tts.TextToSpeech? = null
+    private var speechReady = false
+    private var lastSpeech = 0L
+    override fun onStop() { stopGuidance?.invoke(); speech?.stop(); super.onStop() }
+    override fun onDestroy() { sonar?.release(); shutterSound.release(); speech?.shutdown(); super.onDestroy() }
     private val measurementScreen = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) showTimeline()
     }
@@ -178,7 +181,7 @@ class MainActivity : ComponentActivity() {
         cameraScreen = true
         root.removeAllViews()
         root.addView(label("白黒で記録する", 24f))
-        root.addView(label("黄色の枠を中央へ。\nソナーをONにすると安定後に自動撮影します。", 14f))
+        root.addView(label("黄色の枠を中央へ。青い丸でピントを合わせます。\n画面をタップして位置を指定することもできます。", 14f))
         val detectionStatus = label("検出の準備中…", 14f)
         val preview = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -194,207 +197,265 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(cameraFrame, LinearLayout.LayoutParams(-1, 0, 1f))
         val qualityStatus = label("撮影サイズを確認中…", 12f)
-        root.addView(qualityStatus)
-        root.addView(detectionStatus)
+        root.addView(qualityStatus); root.addView(detectionStatus)
         val automatic = Switch(this).apply { text = "ソナー音・自動撮影" }
         root.addView(automatic)
+        val note = EditText(this).apply { hint = "今日のメモ（任意）"; maxLines = 2; filters = arrayOf(android.text.InputFilter.LengthFilter(500)) }
+        root.addView(note)
+        val shutter = button("カメラの準備中…") {}.apply { isEnabled = false }
+        root.addView(shutter)
+        val force = button("ピント確認を省略して撮影") {}.apply { visibility = View.GONE }
+        root.addView(force)
+        val back = button("記録一覧へ") { if (!busy) showTimeline() }
+        root.addView(back)
         val gate = AutoCaptureGate()
-        var ready = false
-        var lastSeen = 0L
-        var lastTone = 0L
-        var focusing = false
-        var focusGeneration = 0
+        var lastSeen = 0L; var lastTone = 0L; var retryAfter = 0L
         var focusCamera: androidx.camera.core.Camera? = null
         var latestTarget: AutoCaptureGate.Target? = null
+        var focusedTarget: AutoCaptureGate.Target? = null
+        var options = emptyList<FocusTexture.Option>()
+        var tapped: FocusTexture.Point? = null
+        val requested = java.util.concurrent.atomic.AtomicReference<FocusTexture.Point?>(null)
+        val scanActive = java.util.concurrent.atomic.AtomicBoolean(false)
+        data class Mapping(val source: androidx.camera.view.transform.OutputTransform, val crop: Rect)
+        var mapping: Mapping? = null
+        lateinit var focus: FocusCaptureController
+        fun clock() = android.os.SystemClock.elapsedRealtime()
+        fun viewPoint(point: FocusTexture.Point): PointF {
+            val current = mapping; val output = preview.outputTransform
+            if (current == null || output == null) return PointF(point.x * preview.width, point.y * preview.height)
+            val xy = floatArrayOf(current.crop.left + point.x * current.crop.width(), current.crop.top + point.y * current.crop.height())
+            CoordinateTransform(current.source, output).mapPoints(xy)
+            return PointF(xy[0].coerceIn(0f, preview.width.toFloat()), xy[1].coerceIn(0f, preview.height.toFloat()))
+        }
+        fun currentPoints() = (listOfNotNull(tapped) + options.map { it.point }).distinct().take(2)
+        fun usableScreen() = cameraScreen && preview.isAttachedToWindow && !isDestroyed &&
+            lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
         fun resetGuidance() {
-            gate.reset(); ready = false; lastSeen = 0L; lastTone = 0L
-            latestTarget = null; focusing = false; focusGeneration++
+            gate.reset(); lastSeen = 0L; lastTone = 0L; focusedTarget = null
+            sonar?.stopTone(); focus.cancel()
+        }
+        fun capturePhoto() {
+            val imageCapture = capture
+            if (imageCapture == null || !usableScreen()) { focus.finishCapture(); return }
+            busy = true; shutter.isEnabled = false; back.isEnabled = false; force.visibility = View.GONE
+            shutter.text = "保存中…"
+            // The toggle listener may reset guidance, but the controller keeps AF locked while capturing.
+            automatic.isChecked = false
             sonar?.stopTone()
-            focusCamera?.cameraControl?.cancelFocusAndMetering()
+            val memo = note.text.toString().trim()
+            val temp = try { File.createTempFile("capture-", ".jpg", cacheDir) } catch (error: Exception) {
+                focus.finishCapture(); busy = false; shutter.isEnabled = true; back.isEnabled = true
+                shutter.text = "ピントを合わせて撮影"; toast("撮影用の空き容量を確保できませんでした"); return
+            }
+            fun failed() {
+                runOnUiThread {
+                    focus.finishCapture(); busy = false
+                    if (!isDestroyed) {
+                        shutter.isEnabled = true; back.isEnabled = true; shutter.text = "ピントを合わせて撮影"
+                        toast("保存できませんでした。空き容量を確認して、もう一度お試しください")
+                    }
+                }
+            }
+            shutterSound.play(android.media.MediaActionSound.SHUTTER_CLICK)
+            imageCapture.targetRotation = preview.display.rotation
+            try {
+                imageCapture.takePicture(ImageCapture.OutputFileOptions.Builder(temp).build(), worker,
+                    object : ImageCapture.OnImageSavedCallback {
+                        override fun onImageSaved(result: ImageCapture.OutputFileResults) {
+                            // Release only after the high-resolution exposure has completed, before PNG conversion.
+                            runOnUiThread { focus.finishCapture() }
+                            try {
+                                val record = store.save(temp, memo)
+                                runOnUiThread { busy = false; if (!isDestroyed) { toast("記録できたじゃん♡\n${record.resolution?.text.orEmpty()}"); showTimeline() } }
+                            } catch (error: Exception) { failed() } finally { temp.delete() }
+                        }
+                        override fun onError(error: ImageCaptureException) { temp.delete(); failed() }
+                    })
+            } catch (error: Exception) { temp.delete(); failed() }
+        }
+        focus = FocusCaptureController(object : FocusCaptureController.Port {
+            override fun focus(point: FocusTexture.Point, complete: (Boolean) -> Unit) {
+                requested.set(point)
+                val xy = viewPoint(point); overlay.focusAt(xy, false)
+                val metering = preview.meteringPointFactory.createPoint(xy.x, xy.y, .10f)
+                val action = CameraQuality.focusAction(metering)
+                val future = runCatching { focusCamera?.cameraControl?.startFocusAndMetering(action) }.getOrNull()
+                if (future == null) complete(false)
+                else future.addListener({ complete(runCatching { future.get().isFocusSuccessful }.getOrDefault(false)) }, ContextCompat.getMainExecutor(this@MainActivity))
+            }
+            override fun releaseFocus() {
+                requested.set(null); overlay.focusAt(null, false)
+                runCatching { focusCamera?.cameraControl?.cancelFocusAndMetering() }
+            }
+            override fun capture() { capturePhoto() }
+        }, ::clock) {
+            scanActive.set(focus.state == FocusCaptureController.State.FOCUSING)
+            when (focus.state) {
+                FocusCaptureController.State.FOCUSING -> {
+                    shutter.isEnabled = false; shutter.text = "ピントを調整中…"; force.visibility = View.GONE
+                    detectionStatus.text = if (focus.attempt == 0) "髪との境界でピントを調整中。そのまま動かさずに♡" else "別の境界でもう一度ピントを調整中…"
+                    if (focus.attempt == 0 && focus.mode == FocusCaptureController.Mode.AUTOMATIC) speakGuidance("ピントを合わせています。そのまま動かさないでね")
+                }
+                FocusCaptureController.State.HOLDING -> {
+                    shutter.isEnabled = !busy; shutter.text = "ピントを合わせて撮影"
+                    focus.activePoint?.let { overlay.focusAt(viewPoint(it), true) }
+                    detectionStatus.text = "ピントを固定しました。撮影ボタンで記録できます"
+                }
+                FocusCaptureController.State.NEEDS_HELP -> {
+                    shutter.isEnabled = !busy; shutter.text = "ピントを合わせ直して撮影"; force.visibility = View.VISIBLE
+                    gate.reset(); retryAfter = clock() + 3000
+                    detectionStatus.text = "細部を確認できません。少し離す・明るい場所にする・髪との境界をタップして試してください"
+                    if (focus.mode == FocusCaptureController.Mode.AUTOMATIC) {
+                        sonar?.startTone(android.media.ToneGenerator.TONE_PROP_NACK, 150)
+                        speakGuidance("少し離して、髪と地肌の境目を映してね", urgent = true)
+                    }
+                }
+                FocusCaptureController.State.IDLE -> {
+                    shutter.isEnabled = !busy && capture != null; shutter.text = if (busy) "保存中…" else "ピントを合わせて撮影"
+                    force.visibility = View.GONE
+                }
+                FocusCaptureController.State.CAPTURING -> { force.visibility = View.GONE }
+            }
         }
         automatic.setOnCheckedChangeListener { _, checked ->
             resetGuidance()
-            if (checked && sonar == null) {
-                sonar = runCatching { android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 60) }.getOrNull()
-                if (sonar == null) toast("音を開始できませんでした。画面の案内で自動撮影します")
+            if (!checked) speech?.stop()
+            if (checked) {
+                tapped = null; retryAfter = 0
+                enableSpeech()
+                if (sonar == null) {
+                    sonar = runCatching { android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 60) }.getOrNull()
+                    if (sonar == null) toast("音を開始できませんでした。画面の案内で自動撮影します")
+                }
             }
         }
-        stopGuidance = { automatic.isChecked = false; resetGuidance() }
-        val note = EditText(this).apply { hint = "今日のメモ（任意）"; maxLines = 2; filters = arrayOf(android.text.InputFilter.LengthFilter(500)) }
-        root.addView(note)
-        val shutter = button("カメラの準備中…") {}
-        shutter.isEnabled = false
-        root.addView(shutter)
-        val back = button("記録一覧へ") { if (!busy) showTimeline() }
-        root.addView(back)
+        stopGuidance = { if (automatic.isChecked) automatic.isChecked = false else resetGuidance() }
+        shutter.setOnClickListener {
+            if (!busy && usableScreen()) {
+                automatic.isChecked = false
+                focus.start(FocusCaptureController.Mode.MANUAL, currentPoints())
+            }
+        }
+        force.setOnClickListener { if (!busy && usableScreen()) focus.captureAnyway() }
+        // Status wrapping and the help button can resize the preview. Keep the marker on the
+        // same camera point when that happens instead of retaining old view pixel coordinates.
+        preview.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            requested.get()?.let { overlay.focusAt(viewPoint(it), focus.state == FocusCaptureController.State.HOLDING) }
+        }
+        preview.setOnTouchListener { view, event ->
+            if (event.action == MotionEvent.ACTION_UP && !busy && usableScreen()) {
+                view.performClick()
+                val current = mapping; val output = preview.outputTransform
+                val point = if (current != null && output != null) {
+                    val xy = floatArrayOf(event.x, event.y)
+                    CoordinateTransform(output, current.source).mapPoints(xy)
+                    FocusTexture.Point((xy[0] - current.crop.left) / current.crop.width(), (xy[1] - current.crop.top) / current.crop.height())
+                } else FocusTexture.Point(event.x / preview.width, event.y / preview.height)
+                if (point.x in 0f..1f && point.y in 0f..1f) {
+                    automatic.isChecked = false; tapped = point
+                    focus.start(FocusCaptureController.Mode.TAP, listOf(point))
+                }
+            }
+            true
+        }
+        val poll = object : Runnable {
+            override fun run() {
+                if (cameraScreen && preview.isAttachedToWindow && !isDestroyed) {
+                    if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) focus.tick()
+                    preview.postDelayed(this, 100)
+                }
+            }
+        }
+        preview.post(poll)
         preview.doOnLayout {
-        val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({
-            if (!cameraScreen || isDestroyed) return@addListener
-            try {
-                provider = future.get()
-                val cameraPreview = CameraQuality.preview().also { it.setSurfaceProvider(preview.surfaceProvider) }
-                capture = CameraQuality.capture()
-                val analysis = CameraQuality.analysis()
-                val detector = ContrastDetector()
-                var lastFrame = 0L
-                analysis.setAnalyzer(analysisWorker) { image ->
-                    try {
-                        val now = android.os.SystemClock.elapsedRealtime()
-                        if (now - lastFrame >= 200) {
-                            lastFrame = now
-                            val crop = image.cropRect
-                            val longest = maxOf(160, crop.width(), crop.height())
-                            val w = maxOf(1, crop.width() * 160 / longest)
-                            val h = maxOf(1, crop.height() * 160 / longest)
-                            val plane = image.planes[0]
-                            val buffer = plane.buffer
-                            val offset = buffer.position()
-                            val pixels = IntArray(w * h) { index ->
-                                val x = crop.left + (index % w) * crop.width() / w
-                                val y = crop.top + (index / w) * crop.height() / h
-                                buffer.get(offset + y * plane.rowStride + x * plane.pixelStride).toInt() and 255
-                            }
-                            val candidate = detector.detect(pixels, w, h)
-                            val source = ImageProxyTransformFactory().apply {
-                                isUsingCropRect = false
-                                isUsingRotationDegrees = false
-                            }.getOutputTransform(image)
-                            val box = candidate?.let { RectF(
-                                crop.left + it.left.toFloat() * crop.width() / w, crop.top + it.top.toFloat() * crop.height() / h,
-                                crop.left + it.right.toFloat() * crop.width() / w, crop.top + it.bottom.toFloat() * crop.height() / h
-                            ) }
-                            runOnUiThread {
-                                if (cameraScreen && preview.isAttachedToWindow && !isDestroyed && !busy) {
+            val future = ProcessCameraProvider.getInstance(this)
+            future.addListener({
+                if (!cameraScreen || isDestroyed || !preview.isAttachedToWindow) return@addListener
+                try {
+                    provider = future.get()
+                    val cameraPreview = CameraQuality.preview().also { it.setSurfaceProvider(preview.surfaceProvider) }
+                    capture = CameraQuality.capture()
+                    val analysis = CameraQuality.analysis()
+                    val detector = ContrastDetector(); var lastFrame = 0L; var lastOptions = 0L
+                    analysis.setAnalyzer(analysisWorker) { image ->
+                        try {
+                            val now = clock()
+                            if (now - lastFrame >= 200) {
+                                lastFrame = now
+                                val crop = Rect(image.cropRect); val longest = maxOf(160, crop.width(), crop.height())
+                                val w = maxOf(1, crop.width() * 160 / longest); val h = maxOf(1, crop.height() * 160 / longest)
+                                val plane = image.planes[0]; val buffer = plane.buffer; val offset = buffer.position()
+                                fun pixel(x: Int, y: Int) = buffer.get(offset + y * plane.rowStride + x * plane.pixelStride).toInt() and 255
+                                val pixels = IntArray(w * h) { i -> pixel(crop.left + (i % w) * crop.width() / w, crop.top + (i / w) * crop.height() / h) }
+                                val candidate = detector.detect(pixels, w, h)
+                                val fw = maxOf(5, crop.width() * minOf(640, longest) / longest)
+                                val fh = maxOf(5, crop.height() * minOf(640, longest) / longest)
+                                fun detailPixel(x: Int, y: Int) = pixel(crop.left + x * crop.width() / fw, crop.top + y * crop.height() / fh)
+                                val region = candidate?.let { Region(it.left.toDouble() / w, it.top.toDouble() / h, it.right.toDouble() / w, it.bottom.toDouble() / h) }
+                                val nextOptions = if (!scanActive.get() && (lastOptions == 0L || now - lastOptions >= 400)) {
+                                    lastOptions = now; FocusTexture.boundaryOptions(fw, fh, region, ::detailPixel)
+                                } else null
+                                val detail = requested.get()?.let { FocusTexture.measure(fw, fh, it, ::detailPixel) }
+                                val source = ImageProxyTransformFactory().apply { isUsingCropRect = false; isUsingRotationDegrees = false }.getOutputTransform(image)
+                                val box = candidate?.let { RectF(crop.left + it.left.toFloat() * crop.width() / w, crop.top + it.top.toFloat() * crop.height() / h,
+                                    crop.left + it.right.toFloat() * crop.width() / w, crop.top + it.bottom.toFloat() * crop.height() / h) }
+                                runOnUiThread {
+                                    if (!usableScreen() || busy || clock() - now >= 450) return@runOnUiThread
+                                    mapping = Mapping(source, crop)
+                                    if (nextOptions != null) options = nextOptions
                                     val output = preview.outputTransform
-                                    if (box != null && output != null && android.os.SystemClock.elapsedRealtime() - now < 450) {
-                                        CoordinateTransform(source, output).mapRect(box)
-                                        if (box.intersect(0f, 0f, preview.width.toFloat(), preview.height.toFloat())) {
-                                            overlay.update(box)
-                                            val distance = kotlin.math.hypot(
-                                                (box.centerX() - preview.width / 2f) / preview.width,
-                                                (box.centerY() - preview.height / 2f) / preview.height)
-                                            detectionStatus.text = if (distance < 0.18f) "中央です。そのまま動かさずに♡" else "候補の黄色い枠を中央の十字へ"
-                                            if (automatic.isChecked && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
-                                                val clock = android.os.SystemClock.elapsedRealtime()
-                                                val target = AutoCaptureGate.Target(box.centerX().toDouble() / preview.width,
-                                                    box.centerY().toDouble() / preview.height,
-                                                    box.width().toDouble() * box.height() / (preview.width.toDouble() * preview.height))
-                                                latestTarget = target
-                                                lastSeen = now
-                                                ready = gate.update(target, now)
-                                                detectionStatus.text = if (focusing) "ピントを調整中…このまま♡" else gate.status
-                                                if (clock - lastTone >= AutoCaptureGate.interval(distance.toDouble())) {
-                                                    sonar?.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 70)
-                                                    lastTone = clock
-                                                }
-                                                if (ready && !focusing) {
-                                                    focusing = true
-                                                    val generation = ++focusGeneration
-                                                    val focusedTarget = target
-                                                    val point = preview.meteringPointFactory.createPoint(box.centerX(), box.centerY())
-                                                    val focus = runCatching { focusCamera?.cameraControl?.startFocusAndMetering(
-                                                        FocusMeteringAction.Builder(point).setAutoCancelDuration(2, java.util.concurrent.TimeUnit.SECONDS).build()) }.getOrNull()
-                                                    detectionStatus.text = "ピントを確認中…"
-                                                    fun finishFocus() {
-                                                        if (generation != focusGeneration) return
-                                                        val current = latestTarget
-                                                        val sameTarget = current != null && kotlin.math.hypot(current.x - focusedTarget.x, current.y - focusedTarget.y) < .10 &&
-                                                            kotlin.math.abs(current.area - focusedTarget.area) / focusedTarget.area.coerceAtLeast(.0001) < .75 &&
-                                                            kotlin.math.hypot(current.x - .5, current.y - .5) <= .18
-                                                        if (sameTarget && automatic.isChecked && cameraScreen &&
-                                                            preview.isAttachedToWindow && !busy && !isDestroyed &&
-                                                            lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
-                                                            android.os.SystemClock.elapsedRealtime() - lastSeen < 450) {
-                                                            automatic.isChecked = false
-                                                            shutter.performClick()
-                                                        } else {
-                                                            resetGuidance()
-                                                            detectionStatus.text = "位置が変わりました。もう一度ガイドの中へ"
-                                                        }
-                                                    }
-                                                    // Skin often cannot satisfy the device's AF-success flag.
-                                                    // Allow a bounded settling period, then use fresh positional checks.
-                                                    preview.postDelayed({ finishFocus() }, 1400)
-                                                    focus?.addListener({
-                                                        if (generation != focusGeneration) return@addListener
-                                                        if (runCatching { focus.get().isFocusSuccessful }.getOrDefault(false)) finishFocus()
-                                                    }, ContextCompat.getMainExecutor(this))
-                                                }
-                                            }
-                                        } else { resetGuidance(); overlay.update(null); detectionStatus.text = "候補を探しています…" }
-                                    } else { resetGuidance(); overlay.update(null); detectionStatus.text = "髪と頭皮を一緒に映してね。候補を探しています…" }
+                                    val found = box != null && output != null && run { CoordinateTransform(source, output).mapRect(box); box.intersect(0f, 0f, preview.width.toFloat(), preview.height.toFloat()) }
+                                    val target = if (found) AutoCaptureGate.Target(box!!.centerX().toDouble() / preview.width, box.centerY().toDouble() / preview.height,
+                                        box.width().toDouble() * box.height() / (preview.width.toDouble() * preview.height)) else null
+                                    latestTarget = target
+                                    if (target != null) lastSeen = now
+                                    overlay.update(if (found) box else null)
+                                    if (focus.state == FocusCaptureController.State.FOCUSING && focus.mode == FocusCaptureController.Mode.AUTOMATIC) {
+                                        val initial = focusedTarget
+                                        val same = target != null && initial != null && kotlin.math.hypot(target.x - initial.x, target.y - initial.y) < .12 &&
+                                            kotlin.math.abs(target.area - initial.area) / initial.area.coerceAtLeast(.0001) < 1.25 && kotlin.math.hypot(target.x - .5, target.y - .5) <= .18
+                                        if (!same) { resetGuidance(); detectionStatus.text = "位置が変わりました。もう一度ガイドの中へ" }
+                                    }
+                                    focus.observe(detail, now)
+                                    if (busy) return@runOnUiThread
+                                    val distance = target?.let { kotlin.math.hypot(it.x - .5, it.y - .5) }
+                                    if (automatic.isChecked) {
+                                        val ready = gate.update(target, now)
+                                        if (target != null && clock() >= retryAfter && clock() - lastTone >= AutoCaptureGate.interval(distance!!)) {
+                                            sonar?.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 70); lastTone = clock()
+                                        }
+                                        if (ready && focus.state != FocusCaptureController.State.FOCUSING && clock() >= retryAfter && clock() - lastSeen < 450) {
+                                            focusedTarget = latestTarget
+                                            focus.start(FocusCaptureController.Mode.AUTOMATIC, options.map { it.point })
+                                        } else if (focus.state == FocusCaptureController.State.IDLE) detectionStatus.text = if (target == null) "髪と頭皮を一緒に映してね。候補を探しています…" else gate.status
+                                    } else if (focus.state == FocusCaptureController.State.IDLE) {
+                                        detectionStatus.text = if (target == null) "髪と頭皮を一緒に映してね。タップでピント位置も指定できます" else if (distance!! < .18) "中央です。撮影ボタンで境界にピントを合わせます" else "候補の黄色い枠を中央の十字へ"
+                                    }
                                 }
                             }
-                        }
-                    } catch (error: Exception) {
-                        runOnUiThread {
-                            if (cameraScreen && preview.isAttachedToWindow && !isDestroyed) {
-                                resetGuidance(); overlay.update(null); detectionStatus.text = "検出を再試行中。手動撮影も使えます"
-                            }
-                        }
-                    } finally { image.close() }
-                }
-                provider!!.unbindAll()
-                fun cameraGroup() = UseCaseGroup.Builder().addUseCase(cameraPreview).addUseCase(capture!!).addUseCase(analysis)
-                    .setViewPort(ViewPort.Builder(android.util.Rational(preview.width, preview.height), preview.display.rotation)
-                        .setScaleType(ViewPort.FIT).build()).build()
-                try {
-                    focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraGroup())
-                } catch (error: IllegalArgumentException) {
+                        } catch (error: Exception) {
+                            runOnUiThread { if (usableScreen() && !busy) { resetGuidance(); overlay.update(null); detectionStatus.text = "検出を再試行中。手動撮影も使えます" } }
+                        } finally { image.close() }
+                    }
                     provider!!.unbindAll()
-                    capture = CameraQuality.capture(includeSlowHighResolution = false)
-                    try {
-                        focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraGroup())
-                    } catch (standardError: IllegalArgumentException) {
-                        analysis.clearAnalyzer(); automatic.isEnabled = false
-                        provider!!.unbindAll()
-                        provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraPreview, capture)
-                        detectionStatus.text = "この端末では検出を起動できません。手動撮影は使えます"
+                    fun cameraGroup() = UseCaseGroup.Builder().addUseCase(cameraPreview).addUseCase(capture!!).addUseCase(analysis)
+                        .setViewPort(ViewPort.Builder(android.util.Rational(preview.width, preview.height), preview.display.rotation).setScaleType(ViewPort.FIT).build()).build()
+                    try { focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraGroup()) }
+                    catch (error: IllegalArgumentException) {
+                        provider!!.unbindAll(); capture = CameraQuality.capture(includeSlowHighResolution = false)
+                        try { focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraGroup()) }
+                        catch (standardError: IllegalArgumentException) {
+                            analysis.clearAnalyzer(); automatic.isEnabled = false; focus.analysisAvailable = false; provider!!.unbindAll()
+                            focusCamera = provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, cameraPreview, capture)
+                            detectionStatus.text = "この端末では検出を起動できません。タップと手動撮影は使えます"
+                        }
                     }
-                }
-                val stillSize = capture?.resolutionInfo?.cropRect
-                val searchSize = analysis.resolutionInfo?.resolution
-                qualityStatus.text = stillSize?.let { "撮影：${it.width()} × ${it.height()} px" }.orEmpty() +
-                    (searchSize?.let { " ／ サーチ：${it.width} × ${it.height}" } ?: "")
-                shutter.text = "● 撮影して保存"
-                shutter.isEnabled = true
-                shutter.setOnClickListener {
-                    val imageCapture = capture ?: return@setOnClickListener
-                    if (busy) return@setOnClickListener
-                    automatic.isChecked = false
-                    resetGuidance()
-                    busy = true; shutter.isEnabled = false; back.isEnabled = false; shutter.text = "保存中…"
-                    val memo = note.text.toString().trim()
-                    val temp = try { File.createTempFile("capture-", ".jpg", cacheDir) } catch (error: Exception) {
-                        busy = false; shutter.isEnabled = true; back.isEnabled = true; shutter.text = "● 撮影して保存"
-                        toast("撮影用の空き容量を確保できませんでした")
-                        return@setOnClickListener
-                    }
-                    shutterSound.play(android.media.MediaActionSound.SHUTTER_CLICK)
-                    imageCapture.targetRotation = preview.display.rotation
-                    imageCapture.takePicture(ImageCapture.OutputFileOptions.Builder(temp).build(), worker,
-                        object : ImageCapture.OnImageSavedCallback {
-                            override fun onImageSaved(result: ImageCapture.OutputFileResults) {
-                                try {
-                                    val record = store.save(temp, memo)
-                                    runOnUiThread { busy = false; if (!isDestroyed) { toast("記録できたじゃん♡\n${record.resolution?.text.orEmpty()}"); showTimeline() } }
-                                } catch (error: Exception) { failed() } finally { temp.delete() }
-                            }
-                            override fun onError(error: ImageCaptureException) { temp.delete(); failed() }
-                            private fun failed() {
-                                runOnUiThread { busy = false; if (!isDestroyed) {
-                                    toast("保存できませんでした。空き容量を確認して、もう一度お試しください")
-                                    shutter.isEnabled = true; back.isEnabled = true; shutter.text = "● 撮影して保存"
-                                } }
-                            }
-                        })
-                }
-            } catch (error: Exception) {
-                toast("背面カメラを起動できませんでした")
-                showTimeline()
-            }
-        }, ContextCompat.getMainExecutor(this))
+                    val stillSize = capture?.resolutionInfo?.cropRect; val searchSize = analysis.resolutionInfo?.resolution
+                    qualityStatus.text = stillSize?.let { "撮影：${it.width()} × ${it.height()} px" }.orEmpty() + (searchSize?.let { " ／ サーチ：${it.width} × ${it.height}" } ?: "")
+                    shutter.text = "ピントを合わせて撮影"; shutter.isEnabled = true
+                } catch (error: Exception) { toast("背面カメラを起動できませんでした"); showTimeline() }
+            }, ContextCompat.getMainExecutor(this))
         }
     }
 
@@ -434,5 +495,19 @@ class MainActivity : ComponentActivity() {
     } ?: "脱毛範囲を記録済み（本数未推定）"
     private fun date(time: Long) = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.JAPAN).format(Date(time))
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+    private fun enableSpeech() {
+        if (speech != null) return
+        speech = android.speech.tts.TextToSpeech(applicationContext) { status -> runOnUiThread {
+            speechReady = status == android.speech.tts.TextToSpeech.SUCCESS &&
+                speech?.setLanguage(Locale.JAPANESE)?.let { it >= 0 } == true
+        } }
+    }
+    private fun speakGuidance(value: String, urgent: Boolean = false) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (speechReady && (urgent || now - lastSpeech >= 3500)) {
+            lastSpeech = now
+            speech?.speak(value, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "camera-guidance")
+        }
+    }
     private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_LONG).show()
 }

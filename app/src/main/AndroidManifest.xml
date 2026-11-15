@@ -1,6 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
+    <queries><intent><action android:name="android.intent.action.TTS_SERVICE" /></intent></queries>
     <application android:icon="@drawable/ic_hagemi" android:dataExtractionRules="@xml/data_extraction_rules" android:label="十円ハゲみちゃん" android:theme="@style/AppTheme" android:allowBackup="false" android:supportsRtl="true">
         <activity android:name=".HairReviewActivity" android:exported="false" />
         <activity android:name=".MeasurementActivity" android:exported="false" android:windowSoftInputMode="adjustResize" />

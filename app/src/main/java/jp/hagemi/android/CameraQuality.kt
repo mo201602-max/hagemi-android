@@ -3,6 +3,8 @@ package jp.hagemi.android
 import android.util.Size
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
+import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.MeteringPoint
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -10,6 +12,8 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 
 /** Low-resolution continuous streams and an independent, quality-prioritized JPEG still stream. */
 object CameraQuality {
+    fun focusAction(point: MeteringPoint) = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+        .disableAutoCancel().build()
     private fun searchSelector() = ResolutionSelector.Builder()
         .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
         .setResolutionStrategy(ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))

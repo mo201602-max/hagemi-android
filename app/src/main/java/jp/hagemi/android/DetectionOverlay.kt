@@ -6,8 +6,11 @@ import android.view.View
 
 class DetectionOverlay(context: Context) : View(context) {
     private var box: RectF? = null
+    private var focusPoint: PointF? = null
+    private var focusReady = false
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 3 * resources.displayMetrics.density }
     fun update(candidate: RectF?) { box = candidate; invalidate() }
+    fun focusAt(point: PointF?, ready: Boolean) { focusPoint = point; focusReady = ready; invalidate() }
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         paint.color = Color.WHITE
@@ -20,6 +23,10 @@ class DetectionOverlay(context: Context) : View(context) {
         box?.let {
             paint.color = Color.rgb(255, 210, 80)
             canvas.drawRoundRect(it, 12f, 12f, paint)
+        }
+        focusPoint?.let {
+            paint.color = if (focusReady) Color.GREEN else Color.CYAN
+            canvas.drawCircle(it.x, it.y, 14 * resources.displayMetrics.density, paint)
         }
     }
 }
