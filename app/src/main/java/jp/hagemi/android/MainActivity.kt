@@ -38,13 +38,13 @@ class MainActivity : ComponentActivity() {
     private var cameraScreen = false
     private var busy = false
     private var stopGuidance: (() -> Unit)? = null
-    private var sonar: android.media.ToneGenerator? = null
+    private var feedback: CameraFeedback? = null
+    private var pendingHandsFree = false
+    private var handsFreeOrientationLocked = false
+    private var orientationRelease = 0
     private val shutterSound = android.media.MediaActionSound()
-    private var speech: android.speech.tts.TextToSpeech? = null
-    private var speechReady = false
-    private var lastSpeech = 0L
-    override fun onStop() { stopGuidance?.invoke(); speech?.stop(); super.onStop() }
-    override fun onDestroy() { sonar?.release(); shutterSound.release(); speech?.shutdown(); super.onDestroy() }
+    override fun onStop() { stopGuidance?.invoke(); feedback?.stop(); super.onStop() }
+    override fun onDestroy() { shutterSound.release(); feedback?.close(); super.onDestroy() }
     private val measurementScreen = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) showTimeline()
     }
@@ -75,10 +75,11 @@ class MainActivity : ComponentActivity() {
         }
     }
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) showCamera() else {
+        if (granted) showCamera(pendingHandsFree) else {
             toast("撮影にはカメラの許可が必要です。端末の設定から変更できます")
             showTimeline()
         }
+        pendingHandsFree = false
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -115,14 +116,14 @@ class MainActivity : ComponentActivity() {
         stopGuidance = null
         cameraScreen = false
         capture = null
+        restoreHandsFreeOrientation()
         provider?.unbindAll()
         root.removeAllViews()
         root.addView(label("十円ハゲみちゃん ♡", 26f))
         root.addView(label("今日も記録できたら、それだけでえらいじゃん♡"))
-        root.addView(button("＋ 白黒で撮影する") {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) showCamera()
-            else permission.launch(Manifest.permission.CAMERA)
-        }.apply { isEnabled = !busy })
+        root.addView(button("見ずに撮る（音・声・振動）") { openCamera(true) }.apply { isEnabled = !busy })
+        root.addView(label("メディア音量を上げて開始。保存完了は3回の振動でお知らせします。", 12f))
+        root.addView(button("画面を見ながら撮影") { openCamera(false) }.apply { isEnabled = !busy })
         root.addView(button("写真を取り込む") {
             importPhoto.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
         }.apply { isEnabled = !busy })
@@ -177,11 +178,13 @@ class MainActivity : ComponentActivity() {
     }
 
     @androidx.annotation.OptIn(androidx.camera.view.TransformExperimental::class)
-    private fun showCamera() {
+    private fun showCamera(handsFree: Boolean = false) {
         cameraScreen = true
         root.removeAllViews()
         root.addView(label("白黒で記録する", 24f))
-        root.addView(label("黄色の枠を中央へ。青い丸でピントを合わせます。\n画面をタップして位置を指定することもできます。", 14f))
+        val instructions = label(if (handsFree) "準備ができたら声で案内します。\n保存完了の声と3回の振動を待ってね。" else
+            "髪と地肌の境界でピントを合わせます。\nタップで位置を指定することもできます。", 14f)
+        root.addView(instructions)
         val detectionStatus = label("検出の準備中…", 14f)
         val preview = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -198,7 +201,7 @@ class MainActivity : ComponentActivity() {
         root.addView(cameraFrame, LinearLayout.LayoutParams(-1, 0, 1f))
         val qualityStatus = label("撮影サイズを確認中…", 12f)
         root.addView(qualityStatus); root.addView(detectionStatus)
-        val automatic = Switch(this).apply { text = "ソナー音・自動撮影" }
+        val automatic = Switch(this).apply { text = "見ずに撮る（音・声・振動）" }
         root.addView(automatic)
         val note = EditText(this).apply { hint = "今日のメモ（任意）"; maxLines = 2; filters = arrayOf(android.text.InputFilter.LengthFilter(500)) }
         root.addView(note)
@@ -209,6 +212,11 @@ class MainActivity : ComponentActivity() {
         val back = button("記録一覧へ") { if (!busy) showTimeline() }
         root.addView(back)
         val gate = AutoCaptureGate()
+        val cues = feedback ?: CameraFeedback(this) {
+            if (!isDestroyed) toast("日本語の音声を開始できません。音と振動で案内します")
+        }.also { feedback = it }
+        val guide = HandsFreeGuide(cues::announce)
+        if (handsFree) cues.prepare()
         var lastSeen = 0L; var lastTone = 0L; var retryAfter = 0L
         var focusCamera: androidx.camera.core.Camera? = null
         var latestTarget: AutoCaptureGate.Target? = null
@@ -233,20 +241,23 @@ class MainActivity : ComponentActivity() {
             lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
         fun resetGuidance() {
             gate.reset(); lastSeen = 0L; lastTone = 0L; focusedTarget = null
-            sonar?.stopTone(); focus.cancel()
+            cues.pauseSonar(); focus.cancel()
         }
         fun capturePhoto() {
             val imageCapture = capture
             if (imageCapture == null || !usableScreen()) { focus.finishCapture(); return }
+            val announceResult = focus.mode == FocusCaptureController.Mode.AUTOMATIC
             busy = true; shutter.isEnabled = false; back.isEnabled = false; force.visibility = View.GONE
             shutter.text = "保存中…"
             // The toggle listener may reset guidance, but the controller keeps AF locked while capturing.
             automatic.isChecked = false
-            sonar?.stopTone()
+            cues.pauseSonar()
             val memo = note.text.toString().trim()
             val temp = try { File.createTempFile("capture-", ".jpg", cacheDir) } catch (error: Exception) {
                 focus.finishCapture(); busy = false; shutter.isEnabled = true; back.isEnabled = true
-                shutter.text = "ピントを合わせて撮影"; toast("撮影用の空き容量を確保できませんでした"); return
+                shutter.text = "ピントを合わせて撮影"; toast("撮影用の空き容量を確保できませんでした")
+                if (announceResult && usableScreen()) cues.announce(HandsFreeGuide.Cue.FAILED)
+                return
             }
             fun failed() {
                 runOnUiThread {
@@ -254,6 +265,7 @@ class MainActivity : ComponentActivity() {
                     if (!isDestroyed) {
                         shutter.isEnabled = true; back.isEnabled = true; shutter.text = "ピントを合わせて撮影"
                         toast("保存できませんでした。空き容量を確認して、もう一度お試しください")
+                        if (announceResult && usableScreen()) cues.announce(HandsFreeGuide.Cue.FAILED)
                     }
                 }
             }
@@ -267,7 +279,11 @@ class MainActivity : ComponentActivity() {
                             runOnUiThread { focus.finishCapture() }
                             try {
                                 val record = store.save(temp, memo)
-                                runOnUiThread { busy = false; if (!isDestroyed) { toast("記録できたじゃん♡\n${record.resolution?.text.orEmpty()}"); showTimeline() } }
+                                runOnUiThread { busy = false; if (!isDestroyed) {
+                                    toast("記録できたじゃん♡\n${record.resolution?.text.orEmpty()}"); showTimeline()
+                                    // Announce after leaving the camera, so teardown does not cancel the completion cue.
+                                    if (announceResult && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) cues.announce(HandsFreeGuide.Cue.SAVED)
+                                } }
                             } catch (error: Exception) { failed() } finally { temp.delete() }
                         }
                         override fun onError(error: ImageCaptureException) { temp.delete(); failed() }
@@ -290,12 +306,17 @@ class MainActivity : ComponentActivity() {
             }
             override fun capture() { capturePhoto() }
         }, ::clock) {
-            scanActive.set(focus.state == FocusCaptureController.State.FOCUSING)
+            scanActive.set(focus.state == FocusCaptureController.State.FOCUSING || focus.state == FocusCaptureController.State.SETTLING)
             when (focus.state) {
                 FocusCaptureController.State.FOCUSING -> {
                     shutter.isEnabled = false; shutter.text = "ピントを調整中…"; force.visibility = View.GONE
                     detectionStatus.text = if (focus.attempt == 0) "髪との境界でピントを調整中。そのまま動かさずに♡" else "別の境界でもう一度ピントを調整中…"
-                    if (focus.attempt == 0 && focus.mode == FocusCaptureController.Mode.AUTOMATIC) speakGuidance("ピントを合わせています。そのまま動かさないでね")
+                    if (focus.mode == FocusCaptureController.Mode.AUTOMATIC) guide.focusing(focus.attempt, clock())
+                }
+                FocusCaptureController.State.SETTLING -> {
+                    shutter.isEnabled = false; shutter.text = "そのまま…撮影します"; force.visibility = View.GONE
+                    detectionStatus.text = "ピントを確認しました。そのまま少し待ってね"
+                    if (focus.mode == FocusCaptureController.Mode.AUTOMATIC) guide.holding(clock())
                 }
                 FocusCaptureController.State.HOLDING -> {
                     shutter.isEnabled = !busy; shutter.text = "ピントを合わせて撮影"
@@ -303,34 +324,40 @@ class MainActivity : ComponentActivity() {
                     detectionStatus.text = "ピントを固定しました。撮影ボタンで記録できます"
                 }
                 FocusCaptureController.State.NEEDS_HELP -> {
-                    shutter.isEnabled = !busy; shutter.text = "ピントを合わせ直して撮影"; force.visibility = View.VISIBLE
+                    shutter.isEnabled = !busy; shutter.text = "ピントを合わせ直して撮影"
+                    force.visibility = if (automatic.isChecked) View.GONE else View.VISIBLE
                     gate.reset(); retryAfter = clock() + 3000
-                    detectionStatus.text = "細部を確認できません。少し離す・明るい場所にする・髪との境界をタップして試してください"
+                    detectionStatus.text = "少し離して、そこで止めてね。ピントを合わせ直します"
                     if (focus.mode == FocusCaptureController.Mode.AUTOMATIC) {
-                        sonar?.startTone(android.media.ToneGenerator.TONE_PROP_NACK, 150)
-                        speakGuidance("少し離して、髪と地肌の境目を映してね", urgent = true)
+                        guide.needsHelp(clock())
                     }
                 }
                 FocusCaptureController.State.IDLE -> {
                     shutter.isEnabled = !busy && capture != null; shutter.text = if (busy) "保存中…" else "ピントを合わせて撮影"
                     force.visibility = View.GONE
+                    if (automatic.isChecked) guide.resumeTracking()
                 }
                 FocusCaptureController.State.CAPTURING -> { force.visibility = View.GONE }
             }
         }
+        focus.automaticSettleMillis = 700
         automatic.setOnCheckedChangeListener { _, checked ->
             resetGuidance()
-            if (!checked) speech?.stop()
+            guide.stop(); cues.stop()
+            shutter.visibility = if (checked) View.GONE else View.VISIBLE
+            note.visibility = if (checked) View.GONE else View.VISIBLE
+            instructions.text = if (checked) "画面は見なくてOK。音が速い位置で止めてね。\n保存完了の声と3回の振動を待ってね。" else
+                "髪と地肌の境界でピントを合わせます。\nタップで位置を指定することもできます。"
             if (checked) {
+                lockHandsFreeOrientation()
                 tapped = null; retryAfter = 0
-                enableSpeech()
-                if (sonar == null) {
-                    sonar = runCatching { android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 60) }.getOrNull()
-                    if (sonar == null) toast("音を開始できませんでした。画面の案内で自動撮影します")
-                }
+                guide.start(clock())
             }
         }
-        stopGuidance = { if (automatic.isChecked) automatic.isChecked = false else resetGuidance() }
+        stopGuidance = {
+            if (automatic.isChecked) automatic.isChecked = false else resetGuidance()
+            guide.stop(); cues.stop()
+        }
         shutter.setOnClickListener {
             if (!busy && usableScreen()) {
                 automatic.isChecked = false
@@ -344,6 +371,7 @@ class MainActivity : ComponentActivity() {
             requested.get()?.let { overlay.focusAt(viewPoint(it), focus.state == FocusCaptureController.State.HOLDING) }
         }
         preview.setOnTouchListener { view, event ->
+            if (automatic.isChecked) return@setOnTouchListener true
             if (event.action == MotionEvent.ACTION_UP && !busy && usableScreen()) {
                 view.performClick()
                 val current = mapping; val output = preview.outputTransform
@@ -411,7 +439,7 @@ class MainActivity : ComponentActivity() {
                                     latestTarget = target
                                     if (target != null) lastSeen = now
                                     overlay.update(if (found) box else null)
-                                    if (focus.state == FocusCaptureController.State.FOCUSING && focus.mode == FocusCaptureController.Mode.AUTOMATIC) {
+                                    if ((focus.state == FocusCaptureController.State.FOCUSING || focus.state == FocusCaptureController.State.SETTLING) && focus.mode == FocusCaptureController.Mode.AUTOMATIC) {
                                         val initial = focusedTarget
                                         val same = target != null && initial != null && kotlin.math.hypot(target.x - initial.x, target.y - initial.y) < .12 &&
                                             kotlin.math.abs(target.area - initial.area) / initial.area.coerceAtLeast(.0001) < 1.25 && kotlin.math.hypot(target.x - .5, target.y - .5) <= .18
@@ -421,14 +449,17 @@ class MainActivity : ComponentActivity() {
                                     if (busy) return@runOnUiThread
                                     val distance = target?.let { kotlin.math.hypot(it.x - .5, it.y - .5) }
                                     if (automatic.isChecked) {
-                                        val ready = gate.update(target, now)
-                                        if (target != null && clock() >= retryAfter && clock() - lastTone >= AutoCaptureGate.interval(distance!!)) {
-                                            sonar?.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 70); lastTone = clock()
+                                        guide.track(target != null, distance != null && distance <= .18, now)
+                                        val ready = if (guide.isArmed(now)) gate.update(target, now) else { gate.reset(); false }
+                                        if (guide.isArmed(now) && target != null && focus.state != FocusCaptureController.State.FOCUSING && focus.state != FocusCaptureController.State.SETTLING &&
+                                            clock() >= retryAfter && clock() - lastTone >= AutoCaptureGate.interval(distance!!)) {
+                                            cues.sonar(); lastTone = clock()
                                         }
-                                        if (ready && focus.state != FocusCaptureController.State.FOCUSING && clock() >= retryAfter && clock() - lastSeen < 450) {
+                                        if (ready && focus.state != FocusCaptureController.State.FOCUSING && focus.state != FocusCaptureController.State.SETTLING && clock() >= retryAfter && clock() - lastSeen < 450) {
                                             focusedTarget = latestTarget
                                             focus.start(FocusCaptureController.Mode.AUTOMATIC, options.map { it.point })
-                                        } else if (focus.state == FocusCaptureController.State.IDLE) detectionStatus.text = if (target == null) "髪と頭皮を一緒に映してね。候補を探しています…" else gate.status
+                                        } else if (focus.state == FocusCaptureController.State.IDLE) detectionStatus.text = if (!guide.isArmed(now)) "構える時間です。3秒後に探し始めます" else
+                                            if (target == null) "髪と頭皮を一緒に映してね。候補を探しています…" else gate.status
                                     } else if (focus.state == FocusCaptureController.State.IDLE) {
                                         detectionStatus.text = if (target == null) "髪と頭皮を一緒に映してね。タップでピント位置も指定できます" else if (distance!! < .18) "中央です。撮影ボタンで境界にピントを合わせます" else "候補の黄色い枠を中央の十字へ"
                                     }
@@ -454,7 +485,13 @@ class MainActivity : ComponentActivity() {
                     val stillSize = capture?.resolutionInfo?.cropRect; val searchSize = analysis.resolutionInfo?.resolution
                     qualityStatus.text = stillSize?.let { "撮影：${it.width()} × ${it.height()} px" }.orEmpty() + (searchSize?.let { " ／ サーチ：${it.width} × ${it.height}" } ?: "")
                     shutter.text = "ピントを合わせて撮影"; shutter.isEnabled = true
-                } catch (error: Exception) { toast("背面カメラを起動できませんでした"); showTimeline() }
+                    if (handsFree) {
+                        if (automatic.isEnabled) automatic.isChecked = true else cues.announce(HandsFreeGuide.Cue.FAILED)
+                    }
+                } catch (error: Exception) {
+                    toast("背面カメラを起動できませんでした"); showTimeline()
+                    if (handsFree && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) cues.announce(HandsFreeGuide.Cue.FAILED)
+                }
             }, ContextCompat.getMainExecutor(this))
         }
     }
@@ -495,19 +532,27 @@ class MainActivity : ComponentActivity() {
     } ?: "脱毛範囲を記録済み（本数未推定）"
     private fun date(time: Long) = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.JAPAN).format(Date(time))
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
-    private fun enableSpeech() {
-        if (speech != null) return
-        speech = android.speech.tts.TextToSpeech(applicationContext) { status -> runOnUiThread {
-            speechReady = status == android.speech.tts.TextToSpeech.SUCCESS &&
-                speech?.setLanguage(Locale.JAPANESE)?.let { it >= 0 } == true
-        } }
+    private fun openCamera(handsFree: Boolean) {
+        pendingHandsFree = handsFree
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            showCamera(handsFree); pendingHandsFree = false
+        } else permission.launch(Manifest.permission.CAMERA)
     }
-    private fun speakGuidance(value: String, urgent: Boolean = false) {
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (speechReady && (urgent || now - lastSpeech >= 3500)) {
-            lastSpeech = now
-            speech?.speak(value, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "camera-guidance")
-        }
+    private fun lockHandsFreeOrientation() {
+        orientationRelease++
+        handsFreeOrientationLocked = true
+        requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LOCKED
+    }
+    private fun restoreHandsFreeOrientation() {
+        if (!handsFreeOrientationLocked) return
+        val token = ++orientationRelease
+        // Keep rotation from recreating the Activity in the middle of the saved voice/vibration cue.
+        root.postDelayed({
+            if (token == orientationRelease && !isDestroyed && !cameraScreen && !busy) {
+                handsFreeOrientationLocked = false
+                requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+        }, 5000)
     }
     private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_LONG).show()
 }
